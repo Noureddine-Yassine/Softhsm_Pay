@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PayHSM — Console Technique HSM · PayLogic</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css?v=19">
+</head>
+<body>
+  <header>
+    <div class="header-brand">
+      <img src="/paylogic-logo.png" alt="PayLogic" class="header-logo-img">
+      <div class="header-divider"></div>
+      <div>
+        <span class="header-product">SoftHSM</span>
+        
+      </div>
+    </div>
+    <div id="hsm-status-header">
+      <span class="status-dot status-locked" id="status-dot"></span>
+      <span id="status-label">Chargement…</span>
+    </div>
+  </header>
+
+  <!-- ══ PayHSM Hardware Module Panel ══ -->
+  <aside class="hsm-device-panel" aria-label="PayHSM Hardware Module">
+
+    <div class="device-topbar">
+      <div class="device-identity">
+        <div class="device-emblem">
+          <svg viewBox="0 0 22 22" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="2.5" y="10" width="17" height="10" rx="2.5" stroke="currentColor" stroke-width="1.6"/>
+            <path d="M6.5 10V7a4.5 4.5 0 0 1 9 0v3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+            <circle cx="11" cy="15" r="1.6" fill="currentColor"/>
+          </svg>
+        </div>
+        <div class="device-info">
+      
+        </div>
+      </div>
+
+      <div class="device-indicators" aria-hidden="true">
+        <div class="led" data-led="pwr"><span></span><em>PWR</em></div>
+        <div class="led" data-led="net"><span></span><em>NET</em></div>
+        <div class="led" data-led="busy"><span></span><em>BUSY</em></div>
+        <div class="led off" data-led="flt"><span></span><em>FLT</em></div>
+        <div class="led off" data-led="key"><span></span><em>KEY</em></div>
+      </div>
+    </div>
+
+    <div class="device-display-section">
+      <div class="display-chrome">
+        <div class="display-chrome-top">
+          <span class="display-chrome-tag">&#9632; SYS</span>
+          <span class="display-chrome-title">SYSTEM&nbsp;DISPLAY</span>
+          <span class="display-chrome-badge" id="display-ready-badge">READY</span>
+        </div>
+        <div class="display-screen-wrap">
+          <pre class="lcd-screen" id="hsm-lcd" aria-live="polite">PAYHSM-1 MODULE
+BOOT ............. OK
+DISPLAY .......... READY
+API .............. —</pre>
+        </div>
+        
+      </div>
+    </div>
+
+  </aside>
+
+  <nav class="tabs" id="tabs">
+    <button type="button" class="active" data-panel="setup">Cycle de vie</button>
+    <button type="button" data-panel="lmk">LMK</button>
+    <button type="button" data-panel="fragments">Fragments</button>
+    <button type="button" data-panel="vault">Coffre</button>
+    <button type="button" data-panel="security">Logs sécurité</button>
+    <button type="button" id="btn-open-float-term" class="tab-term-btn">&#9654; Terminal</button>
+  </nav>
+
+  <main id="main">
+    <section class="panel active" id="panel-setup">
+
+      <!-- Provisionnement + Démarrage sur la même ligne -->
+      <div class="grid grid-2col" style="margin-bottom:1.25rem">
+
+        <!-- Provisionnement -->
+        <div class="card">
+          <h2>Provisionnement du HSM</h2>
+          <p class="hint">Crée le répertoire données. La LMK doit être initialisée séparément dans le panneau <strong>LMK</strong>.</p>
+          <div id="status-provision" class="lifecycle-status lc-idle">En attente</div>
+          <div class="btn-row" style="margin-top:.75rem">
+            <button class="btn btn-primary" id="btn-provision">Provisionner HSM</button>
+          </div>
+        </div>
+
+        <!-- Démarrage -->
+        <div class="card">
+          <h2>Démarrage du HSM</h2>
+          <p class="hint">Démarre le HSM si la LMK est déjà fragmentée en mémoire (TRNG ou SSS). Aucune passphrase requise.</p>
+          <div id="status-startup" class="lifecycle-status lc-idle">En attente</div>
+          <div class="btn-row" style="margin-top:.75rem">
+            <button class="btn btn-primary" id="btn-startup">Démarrer HSM</button>
+            <button class="btn btn-danger" id="btn-shutdown">Éteindre</button>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Liens -->
+      <div class="grid">
+        <div class="card">
+          <h2>Liens</h2>
+          <p class="hint">Simulateur GAB / Switch / HSM — flux ISO 8583 complet avec opérations SoftHSM réelles.</p>
+          <a class="btn btn-primary" href="http://127.0.0.1:5173" target="_blank" rel="noopener">🏧 Simulation GAB / Switch ↗</a>
+        </div>
+      </div>
+
+    </section>
+
+    <section class="panel" id="panel-lmk">
+      <div class="card">
+        <h2>État LMK</h2>
+        
+        <div class="btn-row">
+          <button class="btn" id="btn-lmk-refresh">Actualiser</button>
+          <button class="btn btn-primary" id="btn-lmk-mutate">&#8635; Mutation manuelle</button>
+        </div>
+        <div id="mutate-status" class="lifecycle-status lc-idle" style="margin-top:.6rem;display:none"></div>
+        <pre class="mono-block" id="lmk-status-json">—</pre>
+      </div>
+
+      <!-- Choix de méthode d’initialisation LMK -->
+      <div class="card lmk-method-chooser">
+        <h2>Initialisation MK — Choisir la méthode</h2>
+       
+        <div class="lmk-method-tabs">
+          <button class="lmk-method-btn active" id="btn-method-trng" data-method="trng">
+            TRNG<br><small>Nouvelle MK aléatoire</small>
+          </button>
+          <button class="lmk-method-btn" id="btn-method-sss" data-method="sss">
+           SSS<br><small>Reconstruction depuis parts</small>
+          </button>
+        </div>
+      </div>
+
+      <!-- ── Méthode A : TRNG ── -->
+      <div class="lmk-method-section" id="section-trng">
+        <!-- Étape T0 : Générer la MK avec TRNG -->
+        <div class="card">
+          <h2>T0 — Générer la MK (TRNG)</h2>
+          <p class="hint">
+            Génère une MK 256 bits via <code>RAND_bytes</code> (TRNG noyau + hardware entropy)
+            et la stocke chiffrée (AES-256-GCM) dans <code>mk.bin</code>.
+            La MK n’est jamais affichée. <strong>Requis avant T1.</strong>
+          </p>
+          <div id="mk-status-banner" class="shamir-status-banner shamir-status-unknown">
+            &#9679; Statut mk.bin : inconnu — cliquez Vérifier
+          </div>
+          <label>Mot de passe administrateur</label>
+          <input id="mk-gen-pass" type="password" autocomplete="off" placeholder="Minimum 16 car. — majuscule, minuscule, chiffre, symbole">
+          <div class="pass-strength-wrap" id="pstr-mkgen"></div>
+          <label>Confirmer le mot de passe</label>
+          <input id="mk-gen-pass-confirm" type="password" autocomplete="off" placeholder="Répéter le mot de passe">
+          <div id="mk-gen-pass-match" class="pass-match-hint"></div>
+          <label>Répertoire données</label>
+          <input id="mk-gen-dir" type="text" value="/home/oussama/Desktop/softHSM_main/payhsm-data">
+          <div class="btn-row">
+            <button class="btn btn-primary" id="btn-mk-gen">Générer MK</button>
+            <button class="btn" id="btn-mk-status">Vérifier statut</button>
+          </div>
+          <div class="log" id="mk-gen-log"></div>
+        </div>
+
+        <!-- Étape T1 : Générer les parts SSS (optionnel pour backup) -->
+        <div class="card">
+          <h2>T1 — Générer les parts SSS (optionnel)</h2>
+          <p class="hint">
+            Divise la LMK en 3 parts Shamir (GF(2<sup>8</sup>), seuil 3/3).
+            Génère <code>lmk_share_1.sss</code>, <code>lmk_share_2.sss</code>, <code>lmk_share_3.sss</code> —
+            un fichier par administrateur. <strong>Bloqué si mk.bin absent.</strong>
+          </p>
+          <label>Passphrase (même qu’en T0)</label>
+          <input id="shamir-gen-pass" type="password" autocomplete="off" placeholder="Passphrase pour déchiffrer la MK">
+          <div class="pass-strength-wrap" id="pstr-shamirgen"></div>
+          <label>Répertoire données</label>
+          <input id="shamir-gen-dir" type="text" value="/home/oussama/Desktop/softHSM_main/payhsm-data">
+          <div class="btn-row">
+            <button class="btn btn-primary" id="btn-shamir-gen">Générer Parts SSS</button>
+          </div>
+          <div id="shamir-gen-files" style="display:none">
+            <p class="hint" style="margin-top:.8rem;color:#f6ad55">
+              &#9888; Distribuer <strong>une seule part</strong> à chaque administrateur. Ne jamais stocker les 3 parts ensemble.
+            </p>
+            <div class="shamir-files-list">
+              <div class="shamir-file-item">&#128196; <code>lmk_share_1.sss</code> — Admin 1</div>
+              <div class="shamir-file-item">&#128196; <code>lmk_share_2.sss</code> — Admin 2</div>
+              <div class="shamir-file-item">&#128196; <code>lmk_share_3.sss</code> — Admin 3</div>
+            </div>
+          </div>
+          <div class="log" id="shamir-gen-log"></div>
+        </div>
+      </div>
+
+      <!-- ── Méthode B : SSS ── -->
+      <div class="lmk-method-section" id="section-sss" style="display:none">
+        <!-- S0 : Reconstruction LMK depuis les 3 fichiers SSS -->
+        <div class="card">
+          <h2>Reconstruire la LMK depuis les 3 fichiers SSS</h2>
+          <p class="hint">
+            Sélectionnez les 3 fichiers <code>.sss</code> distribués à chaque administrateur.
+            La LMK est reconstituée temporairement, fragmentée (P1⊕P2⊕P3) en mémoire, puis immédiatement effacée.
+            <strong>Aucun fichier lmk.bin n’est créé.</strong>
+          </p>
+
+          <div class="sss-file-zone">
+            <div class="sss-file-row">
+              <span class="sss-file-label">&#128196; <code>lmk_share_1.sss</code> — Admin 1</span>
+              <input type="file" id="sss-file-1" accept=".sss" class="sss-file-input">
+              <span class="sss-file-status" id="sss-status-1">—</span>
+            </div>
+            <div class="sss-file-row">
+              <span class="sss-file-label">&#128196; <code>lmk_share_2.sss</code> — Admin 2</span>
+              <input type="file" id="sss-file-2" accept=".sss" class="sss-file-input">
+              <span class="sss-file-status" id="sss-status-2">—</span>
+            </div>
+            <div class="sss-file-row">
+              <span class="sss-file-label">&#128196; <code>lmk_share_3.sss</code> — Admin 3</span>
+              <input type="file" id="sss-file-3" accept=".sss" class="sss-file-input">
+              <span class="sss-file-status" id="sss-status-3">—</span>
+            </div>
+          </div>
+
+          <label style="margin-top:.6rem">Répertoire données (pour charger le coffre)</label>
+          <input id="shamir-rec-dir" type="text" value="/home/oussama/Desktop/softHSM_main/payhsm-data">
+
+          <div id="sss-files-ok-banner" class="shamir-status-banner shamir-status-unknown" style="margin-top:.5rem">
+            &#9679; Sélectionnez les 3 fichiers SSS pour activer la reconstruction
+          </div>
+          <div class="btn-row" style="margin-top:.75rem">
+            <button class="btn btn-primary" id="btn-shamir-rec" disabled>Reconstruire LMK &amp; Init HSM</button>
+          </div>
+          <div class="log" id="shamir-rec-log"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-fragments">
+      <div class="card">
+        <h2>Fragments P1 / P2 / P3</h2>
+        <p class="hint">À chaque opération crypto (EMV, PIN, MAC…), le HSM recompose brièvement la LMK (P1⊕P2⊕P3) puis mute les fragments. La <strong>référence LMK</strong> reste stable ; les <strong>empreintes P1/P2/P3</strong> changent — cliquez Actualiser.</p>
+        <div class="btn-row">
+          <button class="btn" id="btn-frag-refresh">Actualiser</button>
+          <button class="btn btn-primary" id="btn-frag-mutate">&#8635; Mutation manuelle</button>
+        </div>
+        <div id="frag-mutate-status" class="lifecycle-status lc-idle" style="margin-top:.6rem;display:none"></div>
+        <div class="lmk-ref-banner" id="frag-lmk-ref" hidden></div>
+        <div class="frag-grid" id="frag-grid"></div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-vault">
+      <div class="card">
+        <h2>Coffre clés (aperçu KCV)</h2>
+        <p class="hint">Clés chiffrées sous LMK dans le HSM. Le Switch stocke les cryptogrammes GCM via synchronisation.</p>
+        <button class="btn" id="btn-vault-refresh">Actualiser</button>
+        <table class="data-table" id="vault-table">
+          <thead><tr><th>ID</th><th>Type</th><th>Terminal</th><th>KCV</th><th>Protection</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-security">
+      <div class="card">
+        <h2>Journal sécurité</h2>
+        <p class="hint">Cycle de vie LMK, opérations crypto (EMV, PIN, MAC, coffre Switch) — PAN masqué.</p>
+        <button class="btn" id="btn-logs-refresh">Actualiser</button>
+        <div class="log log-tall" id="security-log"></div>
+      </div>
+    </section>
+    <!-- ── Terminal HSM ── -->
+  </main>
+
+  <!-- ══ Fenêtre flottante Terminal HSM ══ -->
+  <div id="float-term" class="float-term" style="display:none">
+    <div class="float-term-bar" id="float-term-bar">
+      <span class="float-term-title">&#9632; HSM Terminal</span>
+      <div class="float-term-controls">
+        <button class="float-term-btn" id="btn-float-min"   title="Réduire">&#8212;</button>
+        <button class="float-term-btn" id="btn-float-close" title="Fermer"
+                onclick="document.getElementById('float-term').style.display='none'">&#10005;</button>
+      </div>
+    </div>
+    <div class="terminal-output thin-scroll" id="float-term-output"></div>
+    <div class="terminal-input-row">
+      <span class="term-prompt">HSM&gt;&nbsp;</span>
+      <input type="text" id="float-term-input" class="terminal-input"
+             autocomplete="off" spellcheck="false" placeholder="help">
+      <button class="float-term-btn" id="btn-float-clr" title="Effacer">cls</button>
+    </div>
+  </div>
+
+  <script src="/api-client.js?v=12"></script>
+  <script src="/console.js?v=17"></script>
+</body>
+</html>

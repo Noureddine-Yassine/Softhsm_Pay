@@ -1,0 +1,25 @@
+# PayHSM ISO 8583 daemon — sample configuration
+# Copy to /etc/payhsm/isod.ini or pass as first argument to payhsm-isod
+
+# ── ISO 8583 TCP server ───────────────────────────────────────────
+tcp_host = 0.0.0.0
+tcp_port = 8583
+
+# ── TLS (requires cert + key) ────────────────────────────────────
+tls_enabled   = 0
+tls_cert_path = /etc/payhsm/tls/server.crt
+tls_key_path  = /etc/payhsm/tls/server.key
+
+# ── mTLS (optional — verify client certificates) ─────────────────
+mtls_enabled = 0
+ca_cert_path = /etc/payhsm/tls/ca.crt
+
+# ── Message framing ───────────────────────────────────────────────
+# has_tpdu = 1   # set to 1 if messages include 5-byte TPDU header
+
+# ── HTTP admin API ───────────────────────────────────────────────
+http_host = 127.0.0.1
+http_port = 8765
+
+# ── HSM data directory ────────────────────────────────────────────
+data_dir = /home/oussama/Desktop/payhsm-data

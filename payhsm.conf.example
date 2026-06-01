@@ -1,0 +1,6 @@
+# Terminaux provisionnés (labels TMK:ID)
+terminal=ATM001
+terminal=ATM002
+
+# Répertoire données HSM
+data_dir=./payhsm-data

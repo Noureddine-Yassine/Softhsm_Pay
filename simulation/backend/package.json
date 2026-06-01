@@ -1,0 +1,16 @@
+{
+  "name": "payhsm-simulation-backend",
+  "version": "1.0.0",
+  "description": "Backend de simulation des flux ATM/Switch/HSM (intra-banque et inter-banques) — appelle le payhsm-httpd existant",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "node-fetch": "^3.3.2"
+  }
+}

@@ -1,0 +1,18 @@
+# OpenBao — mode dev (labo PayHSM uniquement, pas pour la production).
+services:
+  openbao:
+    image: openbao/openbao:2.1.0
+    container_name: payhsm-openbao
+    ports:
+      - '8200:8200'
+    environment:
+      OPENBAO_DEV_ROOT_TOKEN_ID: payhsm-dev-token
+      OPENBAO_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    cap_add:
+      - IPC_LOCK
+    command: server -dev -dev-root-token-id=payhsm-dev-token
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '-O', '-', 'http://127.0.0.1:8200/v1/sys/health']
+      interval: 5s
+      timeout: 3s
+      retries: 5

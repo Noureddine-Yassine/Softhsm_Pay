@@ -1,0 +1,37 @@
+# .github/workflows/build.yml
+name: PayHSM CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build_linux:
+    name: Linux OpenSSL 3.x
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dépendances
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libcppunit-dev libssl-dev \
+            libsqlite3-dev p11-kit \
+            valgrind libseccomp-dev
+
+      - name: Build
+        run: |
+          ./autogen.sh
+          ./configure --with-crypto-backend=openssl \
+                      --with-objectstore-backend-db
+          make -j$(nproc)
+
+      - name: Tests SoftHSMv2
+        run: |
+          make check || (find . -name test-suite.log -exec cat {} \; && false)
+
+      - name: Tests modules PayHSM
+        run: |
+          make -C src/lib/payhsm clean test

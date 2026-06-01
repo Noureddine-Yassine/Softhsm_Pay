@@ -1,0 +1,924 @@
+
+' ============================================================
+'  PayHSM — Codes PlantUML de tous les diagrammes de conception
+'  Projet PFE : Soft HSM pour paiements sécurisés
+' ============================================================
+
+
+' ============================================================
+' 1. DIAGRAMME DE CAS D'UTILISATION (Use Case)
+' ============================================================
+
+@startuml UseCase_PayHSM
+!theme plain
+skinparam actorStyle awesome
+skinparam packageStyle rectangle
+skinparam usecaseBorderColor #2980B9
+skinparam usecaseBackgroundColor #EBF5FB
+skinparam actorBorderColor #1A5276
+skinparam linetype ortho
+
+title Diagramme de Cas d'Utilisation — PayHSM
+
+actor "Administrateur\nHSM" as Admin
+actor "Application\nBancaire" as BankApp
+actor "Terminal\nde Paiement (GAP)" as Terminal
+actor "Switch\nInter-Bancaire" as Switch
+actor "Puce\nEMV (Carte)" as Card
+
+rectangle "PayHSM — Système HSM Logiciel" {
+
+  package "Gestion du Cycle de Vie" {
+    usecase "UC01 Provisionner le HSM" as UC01
+    usecase "UC02 Démarrer le HSM" as UC02
+    usecase "UC03 Arrêter proprement" as UC03
+    usecase "UC04 Consulter le statut" as UC04
+  }
+
+  package "Gestion des Clés" {
+    usecase "UC05 Fragmenter la LMK" as UC05
+    usecase "UC06 Vérifier l'intégrité" as UC06
+    usecase "UC07 Muter les fragments" as UC07
+    usecase "UC08 Dériver clés terminal\n(TPK/TAK)" as UC08
+    usecase "UC09 Calculer le KCV" as UC09
+  }
+
+  package "Traitement PIN" {
+    usecase "UC10 Générer PIN Block\n(ISO 9564 Fmt0)" as UC10
+    usecase "UC11 Vérifier PIN (PVV)" as UC11
+    usecase "UC12 Transférer PIN\nTPK → ZPK" as UC12
+    usecase "UC13 Transférer PIN\nZPK → ZPK" as UC13
+  }
+
+  package "Opérations MAC" {
+    usecase "UC14 Calculer MAC TAK\n(ISO 9797-1)" as UC14
+    usecase "UC15 Vérifier MAC" as UC15
+  }
+
+  package "Traitement EMV" {
+    usecase "UC16 Dériver MK-AC\n(EMV Book 2)" as UC16
+    usecase "UC17 Calculer ARQC" as UC17
+    usecase "UC18 Vérifier ARQC" as UC18
+    usecase "UC19 Générer ARPC" as UC19
+    usecase "UC20 Vérifier ARPC (puce)" as UC20
+    usecase "UC21 Simuler achat EMV" as UC21
+  }
+
+  package "Gestion Carte" {
+    usecase "UC22 Enregistrer carte\n(PAN + PIN → PVV)" as UC22
+    usecase "UC23 Émettre PVV\n(Core Banking)" as UC23
+  }
+
+  package "Défense Active" {
+    usecase "UC24 Anti-dump\n(mlock + rlimit)" as UC24
+    usecase "UC25 Anti-ptrace\n(prctl + seccomp)" as UC25
+    usecase "UC26 Arrêt d'urgence" as UC26
+  }
+}
+
+Admin --> UC01
+Admin --> UC02
+Admin --> UC03
+Admin --> UC04
+Admin --> UC07
+
+BankApp --> UC22
+BankApp --> UC23
+BankApp --> UC21
+BankApp --> UC04
+
+Terminal --> UC10
+Terminal --> UC11
+Terminal --> UC12
+
+Switch --> UC12
+Switch --> UC13
+Switch --> UC14
+Switch --> UC15
+Switch --> UC18
+Switch --> UC19
+
+Card --> UC17
+Card --> UC20
+
+UC01 ..> UC05 : <<include>>
+UC01 ..> UC24 : <<include>>
+UC01 ..> UC25 : <<include>>
+UC02 ..> UC06 : <<include>>
+UC02 ..> UC24 : <<include>>
+UC02 ..> UC25 : <<include>>
+UC11 ..> UC06 : <<include>>
+UC21 ..> UC16 : <<include>>
+UC21 ..> UC18 : <<include>>
+UC21 ..> UC19 : <<include>>
+UC12 ..> UC08 : <<include>>
+UC08 ..> UC09 : <<include>>
+UC26 ..> UC03 : <<extend>>
+
+@enduml
+
+
+' ============================================================
+' 2. DIAGRAMME DE CLASSES
+' ============================================================
+
+@startuml Classes_PayHSM
+!theme plain
+skinparam classBackgroundColor #EBF5FB
+skinparam classBorderColor #2980B9
+skinparam classFontStyle bold
+skinparam arrowColor #1A5276
+skinparam packageBackgroundColor #FDFEFE
+skinparam packageBorderColor #AEB6BF
+
+title Diagramme de Classes — PayHSM
+
+package "Core" <<Rectangle>> {
+  class payhsm_ctx_t {
+    +initialized : int
+    +data_dir[256] : char
+    +lmk_path[256] : char
+    +vault : payhsm_key_vault_t
+    --
+    +payhsm_ctx() : payhsm_ctx_t*
+    +payhsm_provision(passphrase, data_dir, terminals, n) : int
+    +payhsm_startup(passphrase, data_dir) : int
+    +payhsm_shutdown() : void
+    +payhsm_get_boot_id() : unsigned long
+    +payhsm_unwrap_key(type, terminal_id, key_out) : int
+    +payhsm_get_lmk_status(st) : int
+    +payhsm_mutate_lmk_fragments() : int
+    +payhsm_status_text(buf, buflen) : int
+  }
+
+  class payhsm_emv_purchase_t {
+    +rc : int
+    +approved : int
+    +tx_data[64] : char
+    +arqc_hex[20] : char
+    +arpc_hex[20] : char
+    +amount_display[32] : char
+    +message[128] : char
+  }
+
+  class payhsm_lmk_status_t {
+    +fragmented : int
+    +integrity_ok : int
+    +mutation_count : int
+    +mutation_last_ts : long
+    +active_token_id[64] : char
+    +data_dir[256] : char
+  }
+}
+
+package "KeyManager" <<Rectangle>> {
+  class payhsm_key_vault_t {
+    +keys[32] : payhsm_key_entry_t[]
+    +count : int
+    +vault_path[256] : char
+    --
+    +vault_add_key(id, type, terminal_id, enc, kcv) : int
+    +vault_find(type, terminal_id, out) : int
+    +vault_find_by_id(id, out) : int
+    +vault_save() : int
+    +vault_load(path) : int
+    +vault_clear() : void
+    +vault_derive_from_lmk(lmk, label, key_out) : int
+    +vault_encrypt_under_lmk(lmk, key, enc_out) : int
+    +vault_decrypt_under_lmk(lmk, enc, key_out) : int
+  }
+
+  class payhsm_key_entry_t {
+    +id[48] : char
+    +type : payhsm_key_type_t
+    +terminal_id[32] : char
+    +enc[16] : uint8_t
+    +kcv[3] : uint8_t
+    +active : int
+  }
+
+  enum payhsm_key_type_t {
+    PAYHSM_KEY_LMK = 0
+    PAYHSM_KEY_TMK
+    PAYHSM_KEY_TPK
+    PAYHSM_KEY_TAK
+    PAYHSM_KEY_ZMK
+    PAYHSM_KEY_ZPK
+    PAYHSM_KEY_PVK
+    PAYHSM_KEY_IMK
+  }
+
+  class XorFragment {
+    +g_P3[32] : uint8_t
+    --
+    +fragment_lmk(lmk) : int
+    +recompose_for_op(out) : int
+    +check_integrity() : int
+    +mutate_fragments() : int
+    +zero_all_fragments() : void
+    +verify_integrity_quiet() : int
+    +tamper_fragment_test() : void
+    +fragment_fingerprint_prefix(which, hex) : void
+  }
+
+  class LmkStore {
+    --
+    +lmk_store_save(path, kek, lmk) : int
+    +lmk_store_load(path, kek, lmk_out) : int
+    +lmk_store_create(path, kek, lmk) : int
+    +lmk_store_create_with_salt(path, kek, lmk, salt) : int
+    +lmk_store_read_salt(path, salt) : int
+  }
+
+  class KekProvider {
+    --
+    +kek_derive_from_passphrase(passphrase, salt, kek_out) : int
+    ' PBKDF2-SHA256, 100 000 itérations
+  }
+
+  class Integrity {
+    --
+    +integrity_set_reference(lmk) : int
+    +integrity_verify_fragments(p1, p2, p3) : int
+    +integrity_clear_reference() : void
+    +integrity_ref_prefix(hex) : void
+  }
+
+  class Mutation {
+    --
+    +mutation_apply(p1, p2, p3) : int
+    +mutation_stats_get(out) : void
+    +mutation_stats_reset() : void
+  }
+
+  class mutation_stats_t {
+    +count : unsigned long
+    +last_ts : time_t
+  }
+}
+
+package "Payment" <<Rectangle>> {
+  class PinModule {
+    --
+    +generate_pin_block(pin, pan, tpk, tpk_len, out) : int
+    +translate_pin_block(pin_block_in, pan, tpk, tpk_len, zpk, zpk_len, out) : int
+    +verify_pin_pvv(pin, pan, pvk, pvk_len, pvv_stored) : int
+    +verify_encrypted_pin_block(pin_block_enc, pan, tpk, tpk_len, pvk, pvk_len, pvv_stored) : int
+    +pin_build_clear_block(pin, pan, clr) : int
+    +pin_decrypt_block(key, key_len, enc, clr) : int
+    +pin_compute_pvv(pin, pan, pvk, pvk_len, pvv_out) : int
+  }
+
+  class MacModule {
+    --
+    +calculate_mac_tak(msg, msg_len, tak, tak_len, mac_out) : int
+    +calculate_mac_zak(msg, msg_len, zak, zak_len, mac_out) : int
+    +verify_mac(msg, msg_len, key, key_len, mac_received) : int
+  }
+
+  class EmvModule {
+    --
+    +derive_card_keys(imk, imk_len, pan, psn, mk_ac_out) : int
+    +derive_sk_ac(mk_ac, atc, sk_ac_out) : int
+    +verify_arqc(sk_ac, transaction_data, tx_len, arqc_received) : int
+    +generate_arpc(mk_ac, arqc, auth_response, arpc_out) : int
+    +verify_arpc(mk_ac, arqc, auth_response, arpc_received) : int
+    +emv_compute_arqc(sk_ac, transaction_data, tx_len, arqc_out) : int
+    +emv_build_tx_data(amount_cents, currency_code3, date, atc_hex4, terminal_id, tx_out, tx_cap, tx_len_out) : int
+  }
+
+  class KeyExchange {
+    --
+    +derive_tpk_from_tmk(tmk, tmk_len, terminal_id, tpk_out) : int
+    +derive_tak_from_tmk(tmk, tmk_len, terminal_id, tak_out) : int
+    +encrypt_zpk_under_zmk(zpk, zpk_len, zmk, zmk_len, out, out_len) : int
+    +decrypt_zpk_under_zmk(enc_zpk, enc_len, zmk, zmk_len, zpk_out) : int
+    +compute_kcv(key, key_len, kcv_out) : int
+  }
+
+  class PKCS11Payment <<C ABI>> {
+    --
+    +PayHSM_is_ready() : int
+    +PayHSM_PIN_translate(pin_block_in, pan, tpk, tpk_len, zpk, zpk_len, pin_block_out) : int
+    +PayHSM_ARQC_verify(sk_ac, transaction_data, tx_len, arqc_received) : int
+    +PayHSM_MAC_calculate(msg, msg_len, tak, tak_len, mac_out) : int
+    +PayHSM_PIN_build(pin, pan, tpk, tpk_len, pin_block_out) : int
+    +PayHSM_EMV_derive_sk_ac(mk_ac, atc, sk_ac_out) : int
+    +PayHSM_EMV_compute_arqc(sk_ac, transaction_data, tx_len, arqc_out) : int
+    +PayHSM_version() : const char*
+  }
+}
+
+package "Defense" <<Rectangle>> {
+  class DefenseModule {
+    --
+    +anti_dump_setup() : int
+    +anti_ptrace_setup() : int
+    +anti_ptrace_check() : int
+    +secure_zero(ptr, len) : void
+    +emergency_shutdown(reason) : void
+  }
+
+  class SeccompPolicy {
+    --
+    +install_seccomp_filter() : int
+    ' Whitelist BPF — appels système autorisés seulement
+  }
+}
+
+package "Switch Interface" <<Rectangle>> {
+  class SwitchModule {
+    --
+    +payhsm_unwrap_lmk_gcm_hex(blob88, key_out) : int
+    +payhsm_unwrap_ecb_hex(parent_key, enc32hex, key_out) : int
+    +payhsm_switch_derive_terminal(tmk_gcm88, terminal_id, tpk_enc, tak_enc, tpk_kcv, tak_kcv) : int
+    +payhsm_gap_switch(tmk_gcm88, tpk_enc32hex, pin, pan, pin_block) : int
+    +payhsm_verify_pin_switch(tmk_gcm88, tpk_enc32hex, pvk_gcm88, pan, pin_block, rc_out) : int
+    +payhsm_translate_pin_switch(tmk_gcm88, tpk_enc32hex, zmk_gcm88, zpk_enc32hex, pin_block_tpk, pin_block_zpk) : int
+    +payhsm_emv_purchase_switch(imk_gcm88, pan, psn, atc_hex, amount_cents, currency_code3, date_yymmdd6, terminal_id, result) : int
+  }
+}
+
+' Relations
+payhsm_ctx_t "1" *-- "1" payhsm_key_vault_t : contient
+payhsm_key_vault_t "1" *-- "0..32" payhsm_key_entry_t : stocke
+payhsm_key_entry_t --> payhsm_key_type_t : type
+payhsm_ctx_t ..> XorFragment : utilise
+payhsm_ctx_t ..> LmkStore : persiste LMK via
+payhsm_ctx_t ..> KekProvider : dérive KEK via
+payhsm_ctx_t ..> Integrity : vérifie via
+payhsm_ctx_t ..> Mutation : applique via
+payhsm_ctx_t ..> DefenseModule : initialise
+payhsm_ctx_t ..> SeccompPolicy : applique
+payhsm_ctx_t ..> PinModule : opérations PIN via
+payhsm_ctx_t ..> MacModule : opérations MAC via
+payhsm_ctx_t ..> EmvModule : opérations EMV via
+payhsm_ctx_t ..> KeyExchange : échanges clés via
+payhsm_ctx_t --> payhsm_emv_purchase_t : produit
+payhsm_ctx_t --> payhsm_lmk_status_t : expose
+Mutation --> mutation_stats_t : expose
+PKCS11Payment ..> PinModule : délègue à
+PKCS11Payment ..> MacModule : délègue à
+PKCS11Payment ..> EmvModule : délègue à
+PKCS11Payment ..> XorFragment : vérifie readiness
+SwitchModule ..> PinModule : utilise
+SwitchModule ..> MacModule : utilise
+SwitchModule ..> EmvModule : utilise
+SwitchModule ..> KeyExchange : utilise
+SwitchModule ..> XorFragment : récompose LMK
+
+@enduml
+
+
+' ============================================================
+' 3. DIAGRAMME DE SÉQUENCE — Démarrage du HSM
+' ============================================================
+
+@startuml Sequence_Startup
+!theme plain
+skinparam sequenceArrowColor #2980B9
+skinparam sequenceLifeLineBorderColor #1A5276
+skinparam sequenceParticipantBackgroundColor #EBF5FB
+skinparam sequenceParticipantBorderColor #2980B9
+skinparam noteBorderColor #E67E22
+skinparam noteBackgroundColor #FDEBD0
+
+title Diagramme de Séquence — Démarrage du HSM (payhsm_startup)
+
+actor "Administrateur" as Admin
+participant "payhsmd\n(Daemon)" as Daemon
+participant "payhsm_core" as Core
+participant "DefenseModule" as Defense
+participant "KekProvider" as KEK
+participant "LmkStore" as LMK
+participant "XorFragment" as Frag
+participant "Integrity" as Integ
+participant "KeyVault" as Vault
+participant "SeccompPolicy" as Seccomp
+
+Admin -> Daemon : payhsm startup <passphrase> <datadir>
+activate Daemon
+
+Daemon -> Core : payhsm_startup(passphrase, data_dir)
+activate Core
+
+Core -> Defense : anti_dump_setup()
+note right : Désactive core dumps\nmlock(MCL_CURRENT|MCL_FUTURE)\nHandlers signaux fatals
+
+Core -> Defense : anti_ptrace_setup()
+note right : prctl(PR_SET_DUMPABLE,0)\nprctl(PR_SET_NO_NEW_PRIVS,1)
+
+Core -> Seccomp : install_seccomp_filter()
+note right : Filtre BPF whitelist\nsyscalls autorisés seulement
+
+Core -> LMK : lmk_store_read_salt(lmk_path, salt)
+activate LMK
+LMK --> Core : salt[16]
+deactivate LMK
+
+Core -> KEK : kek_derive_from_passphrase(passphrase, salt, kek_out)
+activate KEK
+note right : PBKDF2-SHA256\n100 000 itérations
+KEK --> Core : kek[32]
+deactivate KEK
+
+Core -> LMK : lmk_store_load(lmk_path, kek, lmk_out)
+activate LMK
+note right : AES-256-GCM\nDéchiffrement + vérification tag
+LMK --> Core : lmk[32]
+deactivate LMK
+
+Core -> Defense : secure_zero(kek, 32)
+note right : KEK effacé immédiatement
+
+Core -> Frag : fragment_lmk(lmk)
+activate Frag
+note right : P1 (.bss)\nP2 (heap)\nP3 (.data)\nLMK XORée et effacée
+Frag --> Core : 0 (OK)
+deactivate Frag
+
+Core -> Defense : secure_zero(lmk, 32)
+note right : LMK effacée après fragmentation
+
+Core -> Integ : integrity_set_reference(lmk_snapshot)
+activate Integ
+Integ --> Core : HMAC-SHA256 référence stocké
+deactivate Integ
+
+Core -> Vault : vault_load(vault_path)
+activate Vault
+Vault --> Core : clés chargées (TPK/TAK/ZMK/ZPK/PVK/IMK)
+deactivate Vault
+
+Core --> Daemon : PAYHSM_RC_OK
+deactivate Core
+
+Daemon --> Admin : "HSM opérationnel — boot_id=N"
+deactivate Daemon
+
+@enduml
+
+
+' ============================================================
+' 4. DIAGRAMME DE SÉQUENCE — Vérification PIN (Transaction GAP)
+' ============================================================
+
+@startuml Sequence_PIN_Verify
+!theme plain
+skinparam sequenceArrowColor #2980B9
+skinparam sequenceLifeLineBorderColor #1A5276
+skinparam sequenceParticipantBackgroundColor #EBF5FB
+skinparam sequenceParticipantBorderColor #2980B9
+skinparam noteBorderColor #E67E22
+skinparam noteBackgroundColor #FDEBD0
+
+title Diagramme de Séquence — Vérification PIN Block (Flux GAP → HSM)
+
+actor "Porteur de Carte" as Cardholder
+participant "Terminal GAP" as GAP
+participant "Switch\nBancaire" as Switch
+participant "payhsm_core\n(HSM Acquéreur)" as HSM_Acq
+participant "XorFragment" as Frag
+participant "KeyVault" as Vault
+participant "PinModule" as Pin
+participant "payhsm_core\n(HSM Émetteur)" as HSM_Iss
+
+Cardholder -> GAP : Insère carte + saisie PIN
+
+GAP -> GAP : Génère PIN Block ISO 9564 Fmt0\n(chiffré sous TPK local)
+
+GAP -> Switch : Requête autorisation\n+ PIN Block(TPK) + PAN + Montant
+
+Switch -> HSM_Acq : payhsm_translate_pin_to_zpk(terminal_id,\npin_block_tpk, pin_block_zpk)
+activate HSM_Acq
+
+HSM_Acq -> Frag : check_integrity()
+note right : Vérification HMAC\navant toute opération
+Frag --> HSM_Acq : OK
+
+HSM_Acq -> Frag : recompose_for_op(lmk)
+Frag --> HSM_Acq : lmk[32] (temporaire)
+
+HSM_Acq -> Vault : vault_find(TPK, terminal_id)
+Vault --> HSM_Acq : enc_tpk
+
+HSM_Acq -> Vault : vault_decrypt_under_lmk(lmk, enc_tpk, tpk)
+Vault --> HSM_Acq : tpk[16]
+
+HSM_Acq -> Vault : vault_find(ZPK, ...)
+Vault --> HSM_Acq : enc_zpk
+
+HSM_Acq -> Vault : vault_decrypt_under_lmk(lmk, enc_zpk, zpk)
+Vault --> HSM_Acq : zpk[16]
+
+HSM_Acq -> Pin : translate_pin_block(pin_block_tpk, pan,\ntpk, 16, zpk, 16, pin_block_zpk)
+note right : Déchiffre sous TPK\nRe-chiffre sous ZPK\nPIN jamais en clair
+Pin --> HSM_Acq : pin_block_zpk[8]
+
+HSM_Acq -> Frag : secure_zero(lmk,32) & secure_zero(tpk,16) & secure_zero(zpk,16)
+
+HSM_Acq --> Switch : pin_block_zpk
+deactivate HSM_Acq
+
+Switch -> HSM_Iss : payhsm_verify_pin_block_zpk(zpk_key_id,\npan, pin_block_zpk, rc_out)
+activate HSM_Iss
+
+HSM_Iss -> Frag : check_integrity()
+Frag --> HSM_Iss : OK
+HSM_Iss -> Frag : recompose_for_op(lmk)
+Frag --> HSM_Iss : lmk[32]
+
+HSM_Iss -> Vault : vault_decrypt_under_lmk(lmk, enc_zpk_iss, zpk_iss)
+Vault --> HSM_Iss : zpk_iss[16]
+
+HSM_Iss -> Vault : vault_decrypt_under_lmk(lmk, enc_pvk, pvk)
+Vault --> HSM_Iss : pvk[16]
+
+HSM_Iss -> Pin : verify_encrypted_pin_block(pin_block_zpk, pan,\nzpk_iss, 16, pvk, 16, pvv_stored)
+note right : Déchiffre PIN Block\nCalcule PVV\nCompare à PVV stocké\n(temps constant)
+Pin --> HSM_Iss : 0 (valide) ou -1 (refus)
+
+HSM_Iss -> Frag : secure_zero(...) — tous les secrets effacés
+
+HSM_Iss --> Switch : rc_out (0=OK / 55=DECLINED)
+deactivate HSM_Iss
+
+Switch --> GAP : Autorisation (Approbation ou Refus)
+GAP --> Cardholder : "Transaction APPROUVÉE / REFUSÉE"
+
+@enduml
+
+
+' ============================================================
+' 5. DIAGRAMME DE SÉQUENCE — Paiement EMV complet
+' ============================================================
+
+@startuml Sequence_EMV_Purchase
+!theme plain
+skinparam sequenceArrowColor #2980B9
+skinparam sequenceLifeLineBorderColor #1A5276
+skinparam sequenceParticipantBackgroundColor #EBF5FB
+skinparam sequenceParticipantBorderColor #2980B9
+
+title Diagramme de Séquence — Simulation Paiement EMV
+
+participant "Application\nBancaire" as App
+participant "payhsm_core" as Core
+participant "XorFragment" as Frag
+participant "KeyVault" as Vault
+participant "EmvModule" as EMV
+participant "DefenseModule" as Defense
+
+App -> Core : payhsm_emv_simulate_purchase(pan, psn,\natc_hex, amount_cents, currency_code3, result)
+activate Core
+
+Core -> Frag : check_integrity()
+Frag --> Core : OK
+
+Core -> Frag : recompose_for_op(lmk)
+Frag --> Core : lmk[32]
+
+Core -> Vault : vault_find(IMK, ...) + vault_decrypt_under_lmk
+Vault --> Core : imk[16]
+
+Core -> Defense : secure_zero(lmk, 32)
+
+Core -> EMV : derive_card_keys(imk, 16, pan, psn, mk_ac_out)
+note right : Méthode A EMV Book 2\nHMAC-SHA1(IMK, PAN||PSN)
+EMV --> Core : mk_ac[16]
+
+Core -> EMV : emv_build_tx_data(amount_cents, currency_code3,\ndate, atc_hex, terminal_id, tx_out, ...)
+EMV --> Core : tx_data[]
+
+Core -> EMV : derive_sk_ac(mk_ac, atc, sk_ac_out)
+note right : Clé de session\nUnique par transaction
+EMV --> Core : sk_ac[16]
+
+Core -> EMV : emv_compute_arqc(sk_ac, tx_data, tx_len, arqc_out)
+note right : CMAC(SK-AC, données tx)\n= Cryptogramme carte
+EMV --> Core : arqc[8]
+
+Core -> EMV : verify_arqc(sk_ac, tx_data, tx_len, arqc_out)
+note right : Vérification côté HSM\némétteur
+EMV --> Core : 0 (valide)
+
+Core -> EMV : generate_arpc(mk_ac, arqc, auth_response_ARC, arpc_out)
+note right : Réponse d'autorisation\npour la puce carte
+EMV --> Core : arpc[8]
+
+Core -> Defense : secure_zero(mk_ac,16) & secure_zero(sk_ac,16) & secure_zero(imk,16)
+
+Core -> Core : Rempli payhsm_emv_purchase_t\n(rc=0, approved=1, arqc_hex, arpc_hex, amount_display)
+
+Core --> App : result (rc=0, approved=true, arqc_hex, arpc_hex)
+deactivate Core
+
+@enduml
+
+
+' ============================================================
+' 6. DIAGRAMME D'ACTIVITÉ — Provisionnement du HSM
+' ============================================================
+
+@startuml Activity_Provision
+!theme plain
+skinparam activityBorderColor #2980B9
+skinparam activityBackgroundColor #EBF5FB
+skinparam activityDiamondBackgroundColor #FDEBD0
+skinparam activityDiamondBorderColor #E67E22
+skinparam arrowColor #1A5276
+
+title Diagramme d'Activité — Provisionnement PayHSM
+
+start
+
+:Reçoit (passphrase, data_dir, terminaux[]);
+
+:anti_dump_setup() — désactive dumps\nmlockall() — mémoire verrouillée;
+
+:anti_ptrace_setup() — bloque debugger\ninstall_seccomp_filter() — syscalls filtrés;
+
+:Créer/vérifier le répertoire data_dir;
+
+:Générer LMK aléatoire 256 bits\nopenssl RAND_bytes(lmk, 32);
+
+:Générer sel aléatoire 128 bits\nopenssl RAND_bytes(salt, 16);
+
+:Dériver KEK depuis passphrase + sel\nPBKDF2-SHA256 (100 000 itérations);
+
+:Chiffrer LMK sous KEK\nAES-256-GCM (nonce aléatoire + tag);
+
+:Persister lmk.bin (salt + nonce + tag + CT);
+
+:secure_zero(kek) — effacer KEK;
+
+:integrity_set_reference(lmk)\nHMAC-SHA256 de la LMK entière;
+
+:fragment_lmk(lmk)\n→ P1 (BSS), P2 (heap), P3 (data)\nP1 ⊕ P2 ⊕ P3 = LMK;
+
+:secure_zero(lmk) — effacer LMK originale;
+
+if (Terminaux fournis ?) then (oui)
+  :Pour chaque terminal_id :
+  - Générer TMK aléatoire
+  - Dériver TPK = AES-CMAC(TMK, terminal_id||"TPK")
+  - Dériver TAK = AES-CMAC(TMK, terminal_id||"TAK")
+  - Calculer KCV(TPK), KCV(TAK)
+  - recompose_for_op(lmk) temporairement
+  - Chiffrer TMK/TPK/TAK sous LMK
+  - secure_zero(lmk,tmk,tpk,tak)
+  - vault_add_key(...);
+else (non — LMK only)
+  :Coffre HSM vide\nclés gérées par le Switch;
+endif
+
+:Persister keys.vault (chiffré sous LMK);
+
+:Afficher "HSM provisionné\nTerminaux : N, Boot-ID : 1";
+
+stop
+
+@enduml
+
+
+' ============================================================
+' 7. DIAGRAMME D'ACTIVITÉ — Translation PIN TPK → ZPK
+' ============================================================
+
+@startuml Activity_PIN_Translation
+!theme plain
+skinparam activityBorderColor #2980B9
+skinparam activityBackgroundColor #EBF5FB
+skinparam activityDiamondBackgroundColor #FDEBD0
+skinparam activityDiamondBorderColor #E67E22
+skinparam arrowColor #1A5276
+
+title Diagramme d'Activité — Translation PIN Block TPK → ZPK
+
+start
+
+:Reçoit (terminal_id, pin_block_tpk[8]);
+
+:Vérifier que HSM est initialisé\n(g_ctx.initialized == 1);
+
+if (HSM initialisé ?) then (non)
+  :Retourner PAYHSM_RC_NOT_INIT;
+  stop
+endif
+
+:check_integrity()\nHMAC-SHA256(P1⊕P2⊕P3) vs référence;
+
+if (Intégrité fragments OK ?) then (non)
+  :emergency_shutdown("fragments corrompus");
+  stop
+endif
+
+:recompose_for_op(lmk)\n— P1 ⊕ P2 ⊕ P3 → LMK temporaire;
+
+:vault_find(TPK, terminal_id)\nvault_decrypt_under_lmk(lmk, enc_tpk, tpk);
+
+:vault_find(ZPK, ...)\nvault_decrypt_under_lmk(lmk, enc_zpk, zpk);
+
+:secure_zero(lmk, 32)\n— LMK effacée immédiatement;
+
+:pin_decrypt_block(tpk, 16, pin_block_tpk, pin_plain)\nDéchiffrement AES-128-ECB;
+
+:Extraire PIN depuis pin_plain\n(Format ISO 9564 Fmt0 : nibbles);
+
+:pin_build_clear_block(pin, pan, clear_block)\nConstruction bloc clair avec PAN;
+
+:AES-128-ECB chiffrement sous ZPK\n→ pin_block_zpk[8];
+
+:secure_zero(tpk, 16)\nsecure_zero(zpk, 16)\nsecure_zero(pin_plain, 8);
+
+:Retourner pin_block_zpk[8];
+
+stop
+
+@enduml
+
+
+' ============================================================
+' 8. DIAGRAMME D'ARCHITECTURE (Component)
+' ============================================================
+
+@startuml Architecture_PayHSM
+!theme plain
+skinparam componentBackgroundColor #EBF5FB
+skinparam componentBorderColor #2980B9
+skinparam componentFontStyle bold
+skinparam packageBackgroundColor #FDFEFE
+skinparam packageBorderColor #AEB6BF
+skinparam interfaceBackgroundColor #D5F5E3
+skinparam interfaceBorderColor #27AE60
+skinparam arrowColor #1A5276
+skinparam databaseBackgroundColor #FDEBD0
+skinparam databaseBorderColor #E67E22
+skinparam noteBackgroundColor #FEF9E7
+skinparam noteBorderColor #F39C12
+
+title Diagramme d'Architecture — PayHSM (vue composants)
+
+' ---- Couche Applications Clientes ----
+package "Applications Clientes" {
+  [Application Bancaire\n(Core Banking)] as BankApp
+  [Terminal de Paiement\n(GAP / EPP)] as Terminal
+  [Switch Inter-Bancaire] as Switch
+  [payhsm-cli\n(CLI)] as CLI
+  [payhsm-httpd\n(REST HTTP)] as HTTPD
+}
+
+' ---- Interface PKCS#11 ----
+interface "PKCS#11\nC ABI" as PKCS11_IF
+note right of PKCS11_IF
+  PayHSM_PIN_translate()
+  PayHSM_ARQC_verify()
+  PayHSM_MAC_calculate()
+  PayHSM_is_ready()
+end note
+
+' ---- Couche Dispatch ----
+package "PayHSM — Couche Dispatch" {
+  [payhsmd\n(Daemon Unix Socket)] as Daemon
+  [payhsm_core\n(Opérations HSM)] as Core
+  [payhsm_switch\n(Mode Switch)] as SwitchLayer
+}
+
+' ---- Couche Paiement ----
+package "Couche Paiement (payment/)" {
+  [pin.c\nISO 9564 Fmt0\nPIN Block / PVV] as PIN
+  [mac.c\nISO 9797-1 Algo3\nRetail MAC / ZAK] as MAC
+  [emv.c\nEMV Book 2\nARQC/ARPC/MK-AC/SK-AC] as EMV
+  [key_exchange.c\nTPK/TAK/ZPK/ZMK\nKCV / PBKDF2] as KE
+}
+
+' ---- Couche Gestion des Clés ----
+package "Couche Gestion des Clés (keymanager/)" {
+  [xor_fragment.c\nFragmentation LMK\nP1⊕P2⊕P3] as XOR
+  [lmk_store.c\nAES-256-GCM\nlmk.bin] as LMKS
+  [kek_provider.c\nPBKDF2-SHA256\n100k itérations] as KEK
+  [key_vault.c\nCoffre des clés\nkeys.vault] as VAULT
+  [integrity.c\nHMAC-SHA256\nVérification fragments] as INTEG
+  [mutation.c\nMutation cyclique XOR\n+ Shuffle heap P2] as MUT
+}
+
+' ---- Couche Défense ----
+package "Couche Défense (defense/)" #FFE8E8 {
+  [defense.c\nAnti-dump / Anti-ptrace\nSecure Zero / Handlers] as DEF
+  [seccomp_policy.c\nFiltre BPF\nWhitelist syscalls] as SECC
+}
+
+' ---- Stockage Persistant ----
+database "Stockage\nPersistant" as Storage {
+  [lmk.bin\n(AES-256-GCM)] as LMKFile
+  [keys.vault\n(chiffré sous LMK)] as VaultFile
+  [cards.pvv\n(PVV par PAN)] as PVVFile
+}
+
+' ---- OpenSSL ----
+[OpenSSL 3.x\n(AES / HMAC / CMAC\nRAND / PBKDF2)] as OSSL
+
+' ---- Relations Clientes ----
+BankApp --> PKCS11_IF
+Terminal --> Daemon : Unix Socket
+Switch --> SwitchLayer : API C directe
+CLI --> Daemon : Unix Socket
+HTTPD --> Core : appels directs
+
+' ---- Dispatch interne ----
+PKCS11_IF --> Core
+Daemon --> Core
+Core --> SwitchLayer
+
+' ---- Couche paiement ----
+Core --> PIN
+Core --> MAC
+Core --> EMV
+Core --> KE
+SwitchLayer --> PIN
+SwitchLayer --> MAC
+SwitchLayer --> EMV
+SwitchLayer --> KE
+
+' ---- Couche clés ----
+Core --> XOR
+Core --> LMKS
+Core --> KEK
+Core --> VAULT
+Core --> INTEG
+Core --> MUT
+
+' ---- Défense (transversale) ----
+Core ..> DEF : <<uses>>
+Core ..> SECC : <<uses>>
+XOR ..> DEF : zero_all_fragments()
+VAULT ..> DEF : secure_zero()
+
+' ---- Stockage ----
+LMKS --> LMKFile
+VAULT --> VaultFile
+Core --> PVVFile
+
+' ---- OpenSSL ----
+PIN --> OSSL
+MAC --> OSSL
+EMV --> OSSL
+KE --> OSSL
+LMKS --> OSSL
+KEK --> OSSL
+XOR --> OSSL
+INTEG --> OSSL
+
+@enduml
+
+
+' ============================================================
+' 9. DIAGRAMME DE SÉQUENCE — Mutation des Fragments LMK
+' ============================================================
+
+@startuml Sequence_Mutation
+!theme plain
+skinparam sequenceArrowColor #2980B9
+skinparam sequenceLifeLineBorderColor #1A5276
+skinparam sequenceParticipantBackgroundColor #EBF5FB
+skinparam sequenceParticipantBorderColor #2980B9
+
+title Diagramme de Séquence — Mutation Cyclique des Fragments LMK
+
+participant "Administrateur\n/ Scheduler" as Admin
+participant "payhsm_core" as Core
+participant "XorFragment" as Frag
+participant "Integrity" as Integ
+participant "Mutation" as Mut
+participant "DefenseModule" as Def
+
+Admin -> Core : payhsm_mutate_lmk_fragments()
+activate Core
+
+Core -> Integ : integrity_verify_fragments(P1, P2, P3)
+note right : Vérification HMAC-SHA256\navant mutation
+Integ --> Core : 0 (fragments valides)
+
+Core -> Frag : recompose_for_op(lmk_check)
+note right : Vérification LMK reconstruite
+Frag --> Core : lmk_check[32]
+
+Core -> Def : secure_zero(lmk_check, 32)
+
+Core -> Mut : mutation_apply(P1, P2, P3)
+note right : XOR P1 et P3 avec nonce aléatoire\nRe-alloue P2 (nouvelle adresse heap)\nMet à jour HMAC de référence\nIncrément compteur mutation
+
+Mut --> Core : 0 (OK)
+
+Core -> Integ : integrity_verify_fragments(P1_new, P2_new, P3_new)
+note right : Vérification post-mutation
+Integ --> Core : 0 (intégrité confirmée)
+
+Core -> Mut : mutation_stats_get(stats)
+Mut --> Core : {count=N, last_ts=T}
+
+Core --> Admin : "Mutation N appliquée — fragments valides"
+deactivate Core
+
+@enduml
+
