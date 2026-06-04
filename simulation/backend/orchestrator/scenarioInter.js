@@ -83,7 +83,7 @@ export async function runInterBank({ pan, pin, amount }) {
       payload: { issuer: net.issuer, bin },
     });
 
-    const cryptoPath = `TPK-${term} → ${CONFIG.KEYS.ZPK} (PayHSM) · réseau → ${issuer}`;
+    const cryptoPath = `${CONFIG.KEYS.TPK} → ${CONFIG.KEYS.ZPK} (PayHSM) · réseau → ${issuer}`;
 
     return {
       txId,

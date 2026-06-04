@@ -44,8 +44,8 @@ export async function getHsmInfo() {
       : null,
     keyCount: status?.keyCount,
     keys: {
-      TPK: pick(`TPK-${CONFIG.GAB_TERMINAL}`),
-      TAK: pick(`TAK-${CONFIG.GAB_TERMINAL}`),
+      TPK: pick(CONFIG.KEYS.TPK),
+      TAK: pick(CONFIG.KEYS.TAK),
       ZPK: pick(CONFIG.KEYS.ZPK),
       PVK: pick(CONFIG.KEYS.PVK),
       IMK: pick(CONFIG.KEYS.IMK),

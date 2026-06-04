@@ -51,6 +51,16 @@ export const HsmA = {
   wrapKey: (keyHex) => call('/api/switch/wrap-key', { keyHex }),
   wrapZpk: (zmkCryptogram, keyHex) =>
     call('/api/switch/wrap-zpk', { zmkCryptogram, keyHex }),
+
+  hsmCmd: (cmd) => call('/api/hsm/cmd', { cmd }),
+  hsmModeSet: (mode) => call('/api/hsm/mode', { mode }),
+  /** Même blob GCM que A8/L (ext_keys.vault) — pour A6 Switch aligné */
+  transportGcm: (transport = 'ZMK') =>
+    call(`/api/hsm/transport-gcm?transport=${encodeURIComponent(transport)}`),
+  hsmA0: (p) => call('/api/hsm/a0', p),
+  hsmA6: (p) => call('/api/hsm/a6', p),
+  exportUnderZmk: (p) => call('/api/key-exchange/export-under-zmk', p),
+  keyExchangeImport: (p) => call('/api/key-exchange/import', p),
   deriveTerminal: (tmkCryptogram, terminal) =>
     call('/api/switch/derive-terminal', { tmkCryptogram, terminal }),
 

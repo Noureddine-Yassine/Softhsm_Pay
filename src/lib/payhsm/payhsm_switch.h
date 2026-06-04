@@ -17,6 +17,20 @@ int payhsm_unwrap_ecb_hex(const uint8_t parent_key[PAYHSM_KEY_LEN],
                             const char *enc32hex,
                             uint8_t key_out[PAYHSM_KEY_LEN]);
 
+/* Chiffre sous parent → 32 hex ECB */
+int payhsm_wrap_ecb_hex(const uint8_t parent_key[PAYHSM_KEY_LEN],
+                        const uint8_t clear[PAYHSM_KEY_LEN],
+                        char enc32hex[33]);
+
+#define PAYHSM_THALES_BLOCK_LEN 33  /* [scheme:1][cipher:32hex] */
+
+/* Bloc payShield / Thales : scheme + 32 hex sous clé parent */
+int payhsm_thales_block_wrap(const uint8_t parent_key[PAYHSM_KEY_LEN], char scheme,
+                             const uint8_t clear[PAYHSM_KEY_LEN], char out33[PAYHSM_THALES_BLOCK_LEN + 1]);
+int payhsm_thales_block_unwrap(const uint8_t parent_key[PAYHSM_KEY_LEN], const char in33[PAYHSM_THALES_BLOCK_LEN + 1],
+                               uint8_t clear[PAYHSM_KEY_LEN]);
+int payhsm_thales_block_unwrap_lmk(const char in33[PAYHSM_THALES_BLOCK_LEN + 1], uint8_t clear[PAYHSM_KEY_LEN]);
+
 /* Dérive TPK/TAK sous TMK (Switch fournit ENC(LMK,TMK)) → ENC(TMK,TPK/TAK) en hex */
 int payhsm_switch_derive_terminal(const char *tmk_gcm88,
                                   const char *terminal_id,
@@ -45,6 +59,12 @@ int payhsm_switch_wrap_zpk_under_zmk(const char *zmk_gcm88,
                                       const uint8_t zpk[PAYHSM_KEY_LEN],
                                       char zpk_enc32hex[33],
                                       char kcv_out[7]);
+
+/* A8 transport : clé sous LMK (88 hex GCM) → chiffrée sous ZMK (32 hex ECB) */
+int payhsm_switch_wrap_lmk_gcm_under_zmk(const char *zmk_gcm88,
+                                          const char *key_gcm88,
+                                          char key_under_zmk32[33],
+                                          char kcv_out[7]);
 
 int payhsm_translate_pin_switch(const char *tmk_gcm88,
                                 const char *tpk_enc32hex,

@@ -13,6 +13,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
+#include <ctype.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 
@@ -207,6 +208,55 @@ int payhsm_unwrap_ecb_hex(const uint8_t parent_key[PAYHSM_KEY_LEN],
     return ecb_decrypt_under(parent_key, enc, key_out) == 0 ? PAYHSM_RC_OK : PAYHSM_RC_ERR;
 }
 
+int payhsm_wrap_ecb_hex(const uint8_t parent_key[PAYHSM_KEY_LEN],
+                        const uint8_t clear[PAYHSM_KEY_LEN],
+                        char enc32hex[33]) {
+    uint8_t enc[PAYHSM_KEY_LEN];
+    if (ecb_encrypt_under(parent_key, clear, enc) != 0) return PAYHSM_RC_ERR;
+    hex_encode_local(enc, PAYHSM_KEY_LEN, enc32hex);
+    return PAYHSM_RC_OK;
+}
+
+int payhsm_thales_block_wrap(const uint8_t parent_key[PAYHSM_KEY_LEN], char scheme,
+                             const uint8_t clear[PAYHSM_KEY_LEN], char out33[PAYHSM_THALES_BLOCK_LEN + 1]) {
+    char enc32[33];
+    if (payhsm_wrap_ecb_hex(parent_key, clear, enc32) != PAYHSM_RC_OK) return PAYHSM_RC_ERR;
+    out33[0] = (char)toupper((unsigned char)scheme);
+    memcpy(out33 + 1, enc32, 32);
+    out33[33] = '\0';
+    return PAYHSM_RC_OK;
+}
+
+static int thales_scheme_ok(char c) {
+    c = (char)toupper((unsigned char)c);
+    return c == 'U' || c == 'T' || c == 'X' || c == 'Y' || c == 'Z' || c == 'R' || c == 'S';
+}
+
+int payhsm_thales_block_unwrap(const uint8_t parent_key[PAYHSM_KEY_LEN],
+                               const char in33[PAYHSM_THALES_BLOCK_LEN + 1],
+                               uint8_t clear[PAYHSM_KEY_LEN]) {
+    if (!in33 || !thales_scheme_ok(in33[0])) return PAYHSM_RC_ERR;
+    return payhsm_unwrap_ecb_hex(parent_key, in33 + 1, clear);
+}
+
+typedef struct {
+    const char *in33;
+    uint8_t *clear;
+    int rc;
+} thales_lmk_arg_t;
+
+static int thales_unwrap_lmk_fn(const uint8_t lmk[32], void *v) {
+    thales_lmk_arg_t *a = (thales_lmk_arg_t *)v;
+    a->rc = payhsm_thales_block_unwrap(lmk, a->in33, a->clear);
+    return a->rc == PAYHSM_RC_OK ? PAYHSM_RC_OK : PAYHSM_RC_ERR;
+}
+
+int payhsm_thales_block_unwrap_lmk(const char in33[PAYHSM_THALES_BLOCK_LEN + 1],
+                                   uint8_t clear[PAYHSM_KEY_LEN]) {
+    thales_lmk_arg_t a = { in33, clear, PAYHSM_RC_ERR };
+    return with_lmk_op(thales_unwrap_lmk_fn, &a);
+}
+
 typedef struct {
     const uint8_t *key;
     char *blob88;
@@ -226,14 +276,49 @@ int payhsm_wrap_lmk_gcm_hex(const uint8_t key[PAYHSM_KEY_LEN], char blob88[PAYHS
     return with_lmk_op(wrap_fn, &a);
 }
 
+/* ZPK : 88 hex GCM sous LMK (SWITCH PULL / A6) ou 32 hex ECB sous ZMK (export Thales). */
 static int unwrap_zpk_under_zmk(const char *zmk_gcm88,
-                                const char *zpk_enc32hex,
+                                const char *zpk_field,
                                 uint8_t zpk_out[PAYHSM_KEY_LEN]) {
-    uint8_t zmk[PAYHSM_KEY_LEN];
+    if (!zpk_field || !zpk_out) return PAYHSM_RC_ERR;
+    size_t n = strlen(zpk_field);
+    if (n == 88)
+        return payhsm_unwrap_lmk_gcm_hex(zpk_field, zpk_out);
+    if (n == 32 && zmk_gcm88 && zmk_gcm88[0]) {
+        uint8_t zmk[PAYHSM_KEY_LEN];
+        if (payhsm_unwrap_lmk_gcm_hex(zmk_gcm88, zmk) != PAYHSM_RC_OK)
+            return PAYHSM_RC_ERR;
+        int rc = payhsm_unwrap_ecb_hex(zmk, zpk_field, zpk_out);
+        secure_zero(zmk, sizeof(zmk));
+        return rc;
+    }
+    return PAYHSM_RC_ERR;
+}
+
+int payhsm_switch_wrap_lmk_gcm_under_zmk(const char *zmk_gcm88,
+                                          const char *key_gcm88,
+                                          char key_under_zmk32[33],
+                                          char kcv_out[7]) {
+    uint8_t zmk[PAYHSM_KEY_LEN], key[PAYHSM_KEY_LEN], enc[PAYHSM_KEY_LEN], kcv[3];
+    if (!zmk_gcm88 || !key_gcm88 || !key_under_zmk32) return PAYHSM_RC_ERR;
     if (payhsm_unwrap_lmk_gcm_hex(zmk_gcm88, zmk) != PAYHSM_RC_OK) return PAYHSM_RC_ERR;
-    int rc = payhsm_unwrap_ecb_hex(zmk, zpk_enc32hex, zpk_out);
+    if (payhsm_unwrap_lmk_gcm_hex(key_gcm88, key) != PAYHSM_RC_OK) {
+        secure_zero(zmk, sizeof(zmk));
+        return PAYHSM_RC_ERR;
+    }
+    if (ecb_encrypt_under(zmk, key, enc) != 0) {
+        secure_zero(zmk, sizeof(zmk));
+        secure_zero(key, sizeof(key));
+        return PAYHSM_RC_ERR;
+    }
+    hex_encode_local(enc, PAYHSM_KEY_LEN, key_under_zmk32);
+    if (kcv_out) {
+        compute_kcv(key, PAYHSM_KEY_LEN, kcv);
+        snprintf(kcv_out, 7, "%02X%02X%02X", kcv[0], kcv[1], kcv[2]);
+    }
     secure_zero(zmk, sizeof(zmk));
-    return rc;
+    secure_zero(key, sizeof(key));
+    return PAYHSM_RC_OK;
 }
 
 int payhsm_switch_wrap_zpk_under_zmk(const char *zmk_gcm88,
@@ -289,19 +374,34 @@ int payhsm_switch_derive_terminal(const char *tmk_gcm88,
     return PAYHSM_RC_OK;
 }
 
+/* TPK : 88 hex GCM sous LMK (PULL manuel) ou 32 hex ECB sous TMK (dérivation). */
+static int unwrap_tpk_for_switch(const char *tmk_gcm88,
+                                 const char *tpk_field,
+                                 uint8_t tpk_clear[16]) {
+    if (!tpk_field || !tpk_clear) return PAYHSM_RC_ERR;
+    size_t n = strlen(tpk_field);
+    if (n == 88)
+        return payhsm_unwrap_lmk_gcm_hex(tpk_field, tpk_clear);
+    if (n == 32 && tmk_gcm88 && tmk_gcm88[0]) {
+        uint8_t tmk[16];
+        if (payhsm_unwrap_lmk_gcm_hex(tmk_gcm88, tmk) != PAYHSM_RC_OK)
+            return PAYHSM_RC_ERR;
+        int rc = payhsm_unwrap_ecb_hex(tmk, tpk_field, tpk_clear);
+        secure_zero(tmk, sizeof(tmk));
+        return rc;
+    }
+    return PAYHSM_RC_ERR;
+}
+
 int payhsm_gap_switch(const char *tmk_gcm88,
                       const char *tpk_enc32hex,
                       const char *pin,
                       const char *pan,
                       uint8_t pin_block[8]) {
-    uint8_t tmk[16], tpk[16];
-    if (payhsm_unwrap_lmk_gcm_hex(tmk_gcm88, tmk) != PAYHSM_RC_OK) return PAYHSM_RC_ERR;
-    if (payhsm_unwrap_ecb_hex(tmk, tpk_enc32hex, tpk) != PAYHSM_RC_OK) {
-        secure_zero(tmk, sizeof(tmk));
+    uint8_t tpk[16];
+    if (unwrap_tpk_for_switch(tmk_gcm88, tpk_enc32hex, tpk) != PAYHSM_RC_OK)
         return PAYHSM_RC_ERR;
-    }
     int r = generate_pin_block(pin, pan, tpk, 16, pin_block);
-    secure_zero(tmk, sizeof(tmk));
     secure_zero(tpk, sizeof(tpk));
     return r == 0 ? PAYHSM_RC_OK : PAYHSM_RC_ERR;
 }
@@ -316,15 +416,13 @@ int payhsm_verify_pin_switch(const char *tmk_gcm88,
     /* PVV fourni par le Core Banking — le HSM ne le stocke plus */
     if (!pvv_stored || pvv_stored[0] == '\0') return PAYHSM_RC_ERR;
 
-    uint8_t tmk[16], tpk[16], pvk[16];
-    if (payhsm_unwrap_lmk_gcm_hex(tmk_gcm88, tmk) != PAYHSM_RC_OK) return PAYHSM_RC_ERR;
-    if (payhsm_unwrap_ecb_hex(tmk, tpk_enc32hex, tpk) != PAYHSM_RC_OK ||
+    uint8_t tpk[16], pvk[16];
+    if (unwrap_tpk_for_switch(tmk_gcm88, tpk_enc32hex, tpk) != PAYHSM_RC_OK ||
         payhsm_unwrap_lmk_gcm_hex(pvk_gcm88, pvk) != PAYHSM_RC_OK) {
-        secure_zero(tmk, sizeof(tmk));
+        secure_zero(tpk, sizeof(tpk));
         return PAYHSM_RC_ERR;
     }
     int ok = verify_encrypted_pin_block(pin_block, pan, tpk, 16, pvk, 16, pvv_stored);
-    secure_zero(tmk, sizeof(tmk));
     secure_zero(tpk, sizeof(tpk));
     secure_zero(pvk, sizeof(pvk));
     if (rc_out) *rc_out = (ok == 0) ? PAYHSM_RC_OK : PAYHSM_RC_DECLINED;
@@ -337,15 +435,13 @@ int payhsm_translate_pin_switch(const char *tmk_gcm88,
                                 const char *zpk_enc32hex,
                                 const uint8_t pin_block_tpk[8],
                                 uint8_t pin_block_zpk[8]) {
-    uint8_t tmk[16], tpk[16], zpk[16];
-    if (payhsm_unwrap_lmk_gcm_hex(tmk_gcm88, tmk) != PAYHSM_RC_OK) return PAYHSM_RC_ERR;
-    if (payhsm_unwrap_ecb_hex(tmk, tpk_enc32hex, tpk) != PAYHSM_RC_OK ||
+    uint8_t tpk[16], zpk[16];
+    if (unwrap_tpk_for_switch(tmk_gcm88, tpk_enc32hex, tpk) != PAYHSM_RC_OK ||
         unwrap_zpk_under_zmk(zmk_gcm88, zpk_enc32hex, zpk) != PAYHSM_RC_OK) {
-        secure_zero(tmk, sizeof(tmk));
+        secure_zero(tpk, sizeof(tpk));
         return PAYHSM_RC_ERR;
     }
     int r = translate_pin_block(pin_block_tpk, "", tpk, 16, zpk, 16, pin_block_zpk);
-    secure_zero(tmk, sizeof(tmk));
     secure_zero(tpk, sizeof(tpk));
     secure_zero(zpk, sizeof(zpk));
     return r == 0 ? PAYHSM_RC_OK : PAYHSM_RC_ERR;

@@ -11,11 +11,19 @@ import { HsmA } from './hsm/hsmReal.js';
 import { getHsmInfo } from './services/hsmInfo.js';
 import { runIntraBank } from './orchestrator/scenarioIntra.js';
 import { runInterBank } from './orchestrator/scenarioInter.js';
-import { listVault } from './services/switchKeys.js';
+import { listVault, purgeLegacyTerminalKeyAliases } from './services/switchKeys.js';
 import { provisionSwitchVault } from './services/switchProvision.js';
+import {
+  switchAutoImportA6,
+  storeLmkMasterKey,
+  deriveGabKeysFromTmk,
+  listSwitchExchangeLogs,
+} from './services/switchKeyExchange.js';
 import {
   tryRestoreSwitchVault,
   clearSwitchVaultStorage,
+  saveSwitchVault,
+  persistSwitchVault,
 } from './services/switchVaultPersist.js';
 import {
   createOpenBaoRouter,
@@ -49,15 +57,22 @@ app.get('/api/health', async (_req, res) => {
 
         if (currentRef && db.lastLmkRef != null && db.lastLmkRef !== currentRef) {
           db.switchKeyVault.clear();
+          db.switchInitialized = false;
           await clearSwitchVaultStorage();
           console.log(
-            `[HSM] Nouvelle LMK (${db.lastLmkRef} → ${currentRef}) — réinitialisez le coffre Switch.`,
+            `[HSM] Nouvelle LMK (${db.lastLmkRef} → ${currentRef}) — SWITCH INIT puis provision-keys requis.`,
           );
         }
         if (currentRef) db.lastLmkRef = currentRef;
 
         if (db.switchKeyVault.size === 0 && currentRef) {
           await tryRestoreSwitchVault();
+        }
+        if (db.switchKeyVault.size > 0) {
+          const purged = purgeLegacyTerminalKeyAliases();
+          if (purged > 0 && currentRef) {
+            await saveSwitchVault(currentRef, lmk.dataDir).catch(() => {});
+          }
         }
       } catch (err) {
         console.log('[health] Lecture statut LMK:', err.message);
@@ -86,6 +101,8 @@ app.get('/api/health', async (_req, res) => {
     routes: [
       'POST /api/cards/create',
       'GET /api/cards/:pan/emv',
+      'POST /api/switch/init',
+      'POST /api/switch/reset',
       'POST /api/switch/provision-keys',
       'POST /api/emv/purchase',
       'GET /api/payment/modules',
@@ -129,11 +146,61 @@ app.get('/api/cards/:pan/emv', async (req, res) => {
   }
 });
 
-app.get('/api/vault', (_req, res) => {
-  res.json({ SWITCH_KEY_VAULT: listVault() });
+app.get('/api/vault', async (_req, res) => {
+  if (listVault().length === 0) {
+    try {
+      await tryRestoreSwitchVault();
+    } catch (e) {
+      console.log('[vault] restore:', e.message);
+    }
+  }
+  purgeLegacyTerminalKeyAliases();
+  res.json({ SWITCH_KEY_VAULT: listVault(), persisted: listVault().length > 0 });
 });
 
 app.use('/api/openbao', createOpenBaoRouter({ listVault, express }));
+
+app.post('/api/switch/init', async (_req, res) => {
+  let restored = false;
+  let keys = 0;
+  try {
+    restored = await tryRestoreSwitchVault();
+    keys = listVault().length;
+  } catch (e) {
+    console.log('[switch/init] restore:', e.message);
+  }
+  db.switchInitialized = keys > 0 || db.switchInitialized;
+  const purged = purgeLegacyTerminalKeyAliases();
+  if (purged > 0) {
+    try {
+      await persistSwitchVault();
+    } catch (e) {
+      console.log('[switch/init] purge legacy persist:', e.message);
+    }
+  }
+  res.json({
+    ok: true,
+    initialized: true,
+    restored,
+    vaultKeys: listVault().length,
+    legacyAliasesPurged: purged,
+    lmkRef: db.lastLmkRef,
+    message: restored
+      ? `Switch OK — ${keys} clé(s) restaurée(s) (même LMK)`
+      : 'Switch initialisé — établir les clés (STORE / PULL manuels)',
+  });
+});
+
+app.post('/api/switch/reset', async (_req, res) => {
+  db.switchKeyVault.clear();
+  db.switchInitialized = false;
+  db.lastLmkRef = null;
+  await clearSwitchVaultStorage();
+  res.json({
+    ok: true,
+    message: 'Coffre Switch réinitialisé — après nouvelle LMK : switch/init puis provision-keys',
+  });
+});
 
 app.post('/api/switch/provision-keys', async (_req, res) => {
   try {
@@ -143,11 +210,59 @@ app.post('/api/switch/provision-keys', async (_req, res) => {
     res.json({
       ok: true,
       ...r,
-      hint: `Coffre prêt (${disk}${ob}) — cartes Core Banking si besoin.`,
+      hint: r.hint || `Coffre : ${count} clé(s) — établissement manuel terminal HSM.`,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+/** ZMK/TMK après A4 manuel terminal HSM — KEY_BLOCK 88 hex */
+app.post('/api/switch/store-key', async (req, res) => {
+  try {
+    const { keyId, keyType, cryptogram, kcv } = req.body || {};
+    const r = await storeLmkMasterKey({
+      keyId: keyId || keyType,
+      keyType: (keyType || keyId || 'ZMK').toUpperCase(),
+      cryptogram,
+      kcv,
+    });
+    const persisted = r.persisted || await persistSwitchVault();
+    res.json({ ok: true, ...r, persisted });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/** A6 automatique (après A0+EXPORT manuels côté PayHSM) */
+app.post('/api/switch/import-a6', async (req, res) => {
+  try {
+    const { keyId, keyType, keyUnderZmk, kcvExpected, transportKeyId } = req.body || {};
+    const r = await switchAutoImportA6({
+      keyId,
+      keyType: (keyType || keyId || 'ZPK').toUpperCase(),
+      keyUnderZmk,
+      kcvExpected,
+      transportKeyId,
+    });
+    res.json({ ok: true, ...r });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/switch/derive-gab-keys', async (_req, res) => {
+  try {
+    const r = await deriveGabKeysFromTmk();
+    const persisted = await persistSwitchVault();
+    res.json({ ok: true, ...r, persisted });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/switch/exchange-logs', (_req, res) => {
+  res.json({ logs: listSwitchExchangeLogs(80) });
 });
 
 app.post('/api/emv/purchase', async (req, res) => {
@@ -269,15 +384,19 @@ app.listen(CONFIG.PORT, async () => {
   try {
     const h = await HsmA.health();
     if (h.initialized) {
-      await tryRestoreSwitchVault();
+      const restored = await tryRestoreSwitchVault();
       const n = listVault().length;
       if (n > 0) {
-        console.log(`  ✓ Coffre Switch prêt (${n} clés, lié LMK PayHSM)`);
+        console.log(
+          `  ✓ Coffre Switch (${n} clés, LMK liée, ${restored ? 'restauré disque/OpenBao' : 'mémoire'})`,
+        );
       } else {
-        console.log('  → Initialiser coffre Switch (UI) — sauvegardé pour cette LMK');
+        console.log(
+          '  → Coffre Switch vide — après LMK : POST /api/switch/init puis provision-keys (ou hsmctl)',
+        );
       }
     } else {
-      console.log('  ⚠ HSM joignable mais non démarré — Provision LMK + Démarrer sur :8765');
+      console.log('  ⚠ HSM joignable mais non démarré — reconstruire LMK (console :8765 → SSS)');
     }
   } catch (e) {
     console.log(`  ⚠ HSM injoignable: ${e.message}`);

@@ -1,5 +1,5 @@
 /**
- * GAB — le module GAP (EPP) forme le PIN block sous TPK-ATM001.
+ * GAB — le module GAP (EPP) forme le PIN block sous TPK (coffre Switch).
  * L’exécution crypto passe par PayHSM (clés TPK sous LMK) ; le Switch ne voit que le PIN block.
  */
 import { bus } from '../bus.js';
@@ -13,7 +13,7 @@ function maskPan(pan) {
 
 async function gabGap({ txId, pan, pin, amount, terminal, labelExtra }) {
   await requireHsmReady();
-  const tpk = `TPK-${terminal}`;
+  const tpk = CONFIG.KEYS.TPK;
 
   bus.publish({
     txId, stage: 1, from: 'GAB-A', to: 'EPP-A', kind: 'info',
@@ -35,7 +35,7 @@ async function gabGap({ txId, pan, pin, amount, terminal, labelExtra }) {
   });
 
   if (r.rc !== 0 && !r.pinBlock) {
-    throw new Error(r.message || 'GAP échoué — TPK provisionné pour ATM001 ?');
+    throw new Error(r.message || 'GAP échoué — TPK provisionné dans le coffre Switch ?');
   }
 
   bus.publish({

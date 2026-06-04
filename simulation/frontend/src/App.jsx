@@ -9,7 +9,6 @@ import ResultBanner from './components/ResultBanner.jsx';
 import CoreBanking from './components/CoreBanking.jsx';
 import TpeTerminal from './components/TpeTerminal.jsx';
 import MacIntegrity from './components/MacIntegrity.jsx';
-import KeyVault from './components/KeyVault.jsx';
 import OpenBaoConsole from './components/OpenBaoConsole.jsx';
 import BackendBanner from './components/BackendBanner.jsx';
 
@@ -118,7 +117,6 @@ export default function App() {
       {tab === 'banking' && (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
           <CoreBanking key={bankRefresh} />
-          <KeyVault />
           <MacIntegrity />
         </div>
       )}
@@ -180,7 +178,7 @@ export default function App() {
             ) : (
               <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
                 <Actor name="GAB-A" role="ATM acquéreur" events={eventsByActor['GAB-A']} />
-                <Actor name="EPP-A (GAP)" role="TPK-ATM001" events={eventsByActor['EPP-A (GAP)']} />
+                <Actor name="EPP-A (GAP)" role="TPK" events={eventsByActor['EPP-A (GAP)']} />
                 <Actor name="SWITCH-A" role="Switch A" events={eventsByActor['SWITCH-A']} />
                 <Actor name="PayHSM (Banque A)" role="payhsm-httpd :8765" events={eventsByActor['PayHSM (Banque A)']} />
                 <Actor name="NETWORK" role="Réseau CMI" events={eventsByActor['NETWORK']} />

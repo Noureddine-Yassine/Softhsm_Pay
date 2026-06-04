@@ -24,5 +24,5 @@ do
 done
 
 echo "LD payhsm-httpd"
-gcc -o "$OUT" $OBJS -lssl -lcrypto
+gcc -o "$OUT" $OBJS -lssl -lcrypto -lpthread
 echo "OK: $OUT"

@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/style.css?v=19">
+  <link rel="stylesheet" href="/style.css?v=23">
 </head>
 <body>
   <header>
@@ -74,7 +74,6 @@ API .............. —</pre>
     <button type="button" class="active" data-panel="setup">Cycle de vie</button>
     <button type="button" data-panel="lmk">LMK</button>
     <button type="button" data-panel="fragments">Fragments</button>
-    <button type="button" data-panel="vault">Coffre</button>
     <button type="button" data-panel="security">Logs sécurité</button>
     <button type="button" id="btn-open-float-term" class="tab-term-btn">&#9654; Terminal</button>
   </nav>
@@ -88,8 +87,10 @@ API .............. —</pre>
         <!-- Provisionnement -->
         <div class="card">
           <h2>Provisionnement du HSM</h2>
-          <p class="hint">Crée le répertoire données. La LMK doit être initialisée séparément dans le panneau <strong>LMK</strong>.</p>
-          <div id="status-provision" class="lifecycle-status lc-idle">En attente</div>
+          <p class="hint">Nouveau cycle HSM : efface l’ancienne LMK, le coffre et l’état Switch. Puis panneau <strong>LMK</strong> (T0 + SSS), <strong>SWITCH INIT</strong> + <strong>SWITCH PROVISION</strong>.</p>
+          <label>Répertoire données</label>
+          <input id="provision-dir" type="text" placeholder="Ex : /home/user/payhsm-data ou ./payhsm-data">
+          <div id="status-provision" class="lifecycle-status lc-idle" style="margin-top:.5rem">En attente</div>
           <div class="btn-row" style="margin-top:.75rem">
             <button class="btn btn-primary" id="btn-provision">Provisionner HSM</button>
           </div>
@@ -99,7 +100,9 @@ API .............. —</pre>
         <div class="card">
           <h2>Démarrage du HSM</h2>
           <p class="hint">Démarre le HSM si la LMK est déjà fragmentée en mémoire (TRNG ou SSS). Aucune passphrase requise.</p>
-          <div id="status-startup" class="lifecycle-status lc-idle">En attente</div>
+          <label>Répertoire données</label>
+          <input id="startup-dir" type="text" placeholder="Ex : /home/user/payhsm-data ou ./payhsm-data">
+          <div id="status-startup" class="lifecycle-status lc-idle" style="margin-top:.5rem">En attente</div>
           <div class="btn-row" style="margin-top:.75rem">
             <button class="btn btn-primary" id="btn-startup">Démarrer HSM</button>
             <button class="btn btn-danger" id="btn-shutdown">Éteindre</button>
@@ -165,7 +168,7 @@ API .............. —</pre>
           <input id="mk-gen-pass-confirm" type="password" autocomplete="off" placeholder="Répéter le mot de passe">
           <div id="mk-gen-pass-match" class="pass-match-hint"></div>
           <label>Répertoire données</label>
-          <input id="mk-gen-dir" type="text" value="/home/oussama/Desktop/softHSM_main/payhsm-data">
+          <input id="mk-gen-dir" type="text" placeholder="Ex : /home/user/payhsm-data ou ./payhsm-data">
           <div class="btn-row">
             <button class="btn btn-primary" id="btn-mk-gen">Générer MK</button>
             <button class="btn" id="btn-mk-status">Vérifier statut</button>
@@ -184,8 +187,9 @@ API .............. —</pre>
           <label>Passphrase (même qu’en T0)</label>
           <input id="shamir-gen-pass" type="password" autocomplete="off" placeholder="Passphrase pour déchiffrer la MK">
           <div class="pass-strength-wrap" id="pstr-shamirgen"></div>
-          <label>Répertoire données</label>
-          <input id="shamir-gen-dir" type="text" value="/home/oussama/Desktop/softHSM_main/payhsm-data">
+          <label>Répertoire des parts SSS (sortie — indépendant du dossier mk.bin)</label>
+          <input id="shamir-gen-dir" type="text" placeholder="Ex : /home/kali/Bureau/data">
+          <p class="hint" style="margin-top:.35rem">La MK reste lue depuis le répertoire <strong>T0</strong> ci-dessus. Ici : uniquement où écrire <code>lmk_share_*.sss</code>.</p>
           <div class="btn-row">
             <button class="btn btn-primary" id="btn-shamir-gen">Générer Parts SSS</button>
           </div>
@@ -194,9 +198,9 @@ API .............. —</pre>
               &#9888; Distribuer <strong>une seule part</strong> à chaque administrateur. Ne jamais stocker les 3 parts ensemble.
             </p>
             <div class="shamir-files-list">
-              <div class="shamir-file-item">&#128196; <code>lmk_share_1.sss</code> — Admin 1</div>
-              <div class="shamir-file-item">&#128196; <code>lmk_share_2.sss</code> — Admin 2</div>
-              <div class="shamir-file-item">&#128196; <code>lmk_share_3.sss</code> — Admin 3</div>
+              <div class="shamir-file-item">&#128196; Admin 1</div>
+              <div class="shamir-file-item">&#128196; Admin 2</div>
+              <div class="shamir-file-item">&#128196; Admin 3</div>
             </div>
           </div>
           <div class="log" id="shamir-gen-log"></div>
@@ -232,8 +236,9 @@ API .............. —</pre>
             </div>
           </div>
 
-          <label style="margin-top:.6rem">Répertoire données (pour charger le coffre)</label>
-          <input id="shamir-rec-dir" type="text" value="/home/oussama/Desktop/softHSM_main/payhsm-data">
+          <label style="margin-top:.6rem">Répertoire données HSM (coffre — pas le dossier des .sss)</label>
+          <input id="shamir-rec-dir" type="text" placeholder="Ex : /root/softHSM_main23/payhsm-data">
+          <p class="hint" style="margin-top:.35rem">Les 3 fichiers ci-dessus peuvent venir d’un autre dossier ; ce champ = où est le coffre PayHSM (<code>keys.vault</code>).</p>
 
           <div id="sss-files-ok-banner" class="shamir-status-banner shamir-status-unknown" style="margin-top:.5rem">
             &#9679; Sélectionnez les 3 fichiers SSS pour activer la reconstruction
@@ -260,18 +265,6 @@ API .............. —</pre>
       </div>
     </section>
 
-    <section class="panel" id="panel-vault">
-      <div class="card">
-        <h2>Coffre clés (aperçu KCV)</h2>
-        <p class="hint">Clés chiffrées sous LMK dans le HSM. Le Switch stocke les cryptogrammes GCM via synchronisation.</p>
-        <button class="btn" id="btn-vault-refresh">Actualiser</button>
-        <table class="data-table" id="vault-table">
-          <thead><tr><th>ID</th><th>Type</th><th>Terminal</th><th>KCV</th><th>Protection</th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </section>
-
     <section class="panel" id="panel-security">
       <div class="card">
         <h2>Journal sécurité</h2>
@@ -286,7 +279,7 @@ API .............. —</pre>
   <!-- ══ Fenêtre flottante Terminal HSM ══ -->
   <div id="float-term" class="float-term" style="display:none">
     <div class="float-term-bar" id="float-term-bar">
-      <span class="float-term-title">&#9632; HSM Terminal</span>
+      <span class="float-term-title">Terminal</span>
       <div class="float-term-controls">
         <button class="float-term-btn" id="btn-float-min"   title="Réduire">&#8212;</button>
         <button class="float-term-btn" id="btn-float-close" title="Fermer"
@@ -295,14 +288,14 @@ API .............. —</pre>
     </div>
     <div class="terminal-output thin-scroll" id="float-term-output"></div>
     <div class="terminal-input-row">
-      <span class="term-prompt">HSM&gt;&nbsp;</span>
+      <span class="term-prompt">>&gt;&nbsp;</span>
       <input type="text" id="float-term-input" class="terminal-input"
-             autocomplete="off" spellcheck="false" placeholder="help">
+             autocomplete="off" spellcheck="false" placeholder="_">
       <button class="float-term-btn" id="btn-float-clr" title="Effacer">cls</button>
     </div>
   </div>
 
-  <script src="/api-client.js?v=12"></script>
-  <script src="/console.js?v=17"></script>
+  <script src="/api-client.js?v=15"></script>
+  <script src="/console.js?v=24"></script>
 </body>
 </html>

@@ -1,6 +1,6 @@
 /**
  * Coffre Switch — lecture des cryptogrammes (jamais de clé en clair).
- * LMK : GCM 88 hex · TPK/TAK sous TMK : ECB 32 hex · ZPK sous ZMK : ECB 32 hex.
+ * LMK : GCM 88 hex · TPK/TAK/ZPK : GCM 88 sous LMK (PULL) ou ECB 32 sous TMK/ZMK (dérivation / export).
  */
 import { db } from '../db/memdb.js';
 import { CONFIG } from '../config.js';
@@ -8,11 +8,23 @@ import { CONFIG } from '../config.js';
 /** Ancienne démo inter — ne plus charger ni afficher (KCV 8C700F = clé Banque B statique). */
 const OBSOLETE_KEY_IDS = new Set(['ZPK-PEER']);
 
+/** Alias terminal obsolètes (TPK-ATM001…) — clés métier = TPK / TAK directement. */
+const LEGACY_TERMINAL_KEY_RE = /^T(PK|TAK)-/;
+
+export function purgeLegacyTerminalKeyAliases() {
+  let n = 0;
+  for (const id of [...db.switchKeyVault.keys()]) {
+    if (LEGACY_TERMINAL_KEY_RE.test(id) && db.switchKeyVault.delete(id)) n += 1;
+  }
+  return n;
+}
+
 export function purgeObsoleteVaultKeys() {
   let n = 0;
   for (const id of OBSOLETE_KEY_IDS) {
     if (db.switchKeyVault.delete(id)) n += 1;
   }
+  n += purgeLegacyTerminalKeyAliases();
   return n;
 }
 
@@ -34,10 +46,11 @@ export function requireVaultKey(keyId) {
   return k;
 }
 
-export function switchPayloadTerminal(terminal = CONFIG.GAB_TERMINAL) {
+/** GAP / verify / MAC — TPK et TAK du coffre (ids CONFIG.KEYS.TPK / TAK). */
+export function switchPayloadTerminal(_terminal = CONFIG.GAB_TERMINAL) {
   const tmk = requireVaultKey(CONFIG.KEYS.TMK);
-  const tpk = requireVaultKey(`TPK-${terminal}`);
-  const tak = requireVaultKey(`TAK-${terminal}`);
+  const tpk = requireVaultKey(CONFIG.KEYS.TPK);
+  const tak = requireVaultKey(CONFIG.KEYS.TAK);
   return {
     tmkCryptogram: tmk.cryptogram,
     tpkCryptogram: tpk.cryptogram,
