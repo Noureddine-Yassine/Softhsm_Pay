@@ -7,7 +7,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { db } from '../db/memdb.js';
 import { HsmA } from '../hsm/hsmReal.js';
-import { listVault, purgeObsoleteVaultKeys } from './switchKeys.js';
+import { listVault, purgeObsoleteVaultKeys, purgeLegacyTerminalKeyAliases } from './switchKeys.js';
 import { CONFIG } from '../config.js';
 import {
   isOpenBaoEnabled,
@@ -44,15 +44,46 @@ function applyPayloadToMemory(stored) {
   purgeObsoleteVaultKeys();
 }
 
+/** Récupère l'empreinte LMK PayHSM (requise pour sauvegarder le coffre). */
+export async function ensureLmkRef() {
+  if (db.lastLmkRef) return db.lastLmkRef;
+  try {
+    const health = await HsmA.health();
+    if (!health?.initialized) return null;
+    const lmk = await HsmA.lmkStatus();
+    db.lastLmkRef = lmk?.hmacRefPrefix || null;
+    if (lmk?.dataDir) db.lastHsmDataDir = lmk.dataDir;
+  } catch (e) {
+    console.log('[Switch] ensureLmkRef:', e.message);
+    return null;
+  }
+  return db.lastLmkRef;
+}
+
+/** Sauvegarde disque + OpenBao si le coffre contient des clés. */
+export async function persistSwitchVault() {
+  if (listVault().length === 0) {
+    return { disk: false, openbao: false, reason: 'empty' };
+  }
+  const ref = await ensureLmkRef();
+  if (!ref) {
+    console.log('[Switch] Coffre non persisté — LMK indisponible (startup HSM ?)');
+    return { disk: false, openbao: false, reason: 'no_lmk_ref' };
+  }
+  db.switchInitialized = true;
+  return saveSwitchVault(ref, db.lastHsmDataDir);
+}
+
 /**
  * @param {string} lmkRef
  * @param {string} [dataDir]
  * @returns {Promise<{ disk: boolean, openbao: boolean }>}
  */
 export async function saveSwitchVault(lmkRef, dataDir = '') {
-  if (!lmkRef) return { disk: false, openbao: false };
+  const ref = lmkRef || db.lastLmkRef;
+  if (!ref) return { disk: false, openbao: false };
   purgeObsoleteVaultKeys();
-  const payload = buildPayload(lmkRef, dataDir);
+  const payload = buildPayload(ref, dataDir);
   const out = { disk: false, openbao: false };
 
   ensureDataDir();
@@ -85,7 +116,11 @@ function loadSwitchVaultFromDisk(expectedLmkRef) {
   if (!fs.existsSync(VAULT_FILE)) return null;
   try {
     const raw = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf8'));
-    if (raw.lmkRef !== expectedLmkRef || !Array.isArray(raw.keys) || raw.keys.length === 0) {
+    if (!Array.isArray(raw.keys) || raw.keys.length === 0) return null;
+    if (raw.lmkRef !== expectedLmkRef) {
+      console.log(
+        `[Switch] Coffre disque ignoré (LMK fichier=${raw.lmkRef} ≠ LMK courante=${expectedLmkRef})`,
+      );
       return null;
     }
     return raw;
@@ -96,6 +131,7 @@ function loadSwitchVaultFromDisk(expectedLmkRef) {
 }
 
 export async function clearSwitchVaultStorage() {
+  db.switchInitialized = false;
   if (fs.existsSync(VAULT_FILE)) {
     fs.unlinkSync(VAULT_FILE);
     console.log('[Switch] Fichier coffre supprimé (nouvelle LMK)');
@@ -140,6 +176,8 @@ export async function tryRestoreSwitchVault() {
     if (!stored) return false;
 
     applyPayloadToMemory(stored);
+    purgeLegacyTerminalKeyAliases();
+    db.switchInitialized = listVault().length > 0;
     await saveSwitchVault(ref, stored.dataDir);
 
     console.log(

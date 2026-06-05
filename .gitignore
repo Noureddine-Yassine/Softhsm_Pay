@@ -83,3 +83,39 @@ src/lib/test/softhsm2-negative-mech.conf
 src/lib/test/softhsm2.conf
 src/lib/test/tokens/64d6c3fe-1575-1736-1d26-5ccb28440ea7/
 src/lib/test/tokens/dummy
+
+# ════════════════════════════════════════════════════════════════
+# PayHSM — secrets, données runtime et artefacts (NE JAMAIS COMMITER)
+# ════════════════════════════════════════════════════════════════
+
+# Secrets cryptographiques et données runtime du HSM
+payhsm-data/
+*.vault
+*.sss
+lmk.bin
+mk.bin
+switch_state.bin
+cards.pvv
+
+# Core dumps — peuvent contenir des clés/PIN en mémoire claire
+vgcore.*
+
+# Dépendances et build Node.js (simulation + frontend)
+node_modules/
+dist/
+.vite/
+
+# Binaires compilés PayHSM (sans extension → non couverts par *.o/*.a)
+src/lib/payhsm/bin/payhsm-httpd
+src/lib/payhsm/bin/payhsmd
+src/lib/payhsm/bin/payhsm-isod
+src/lib/payhsm/bin/payhsm-cli
+src/lib/payhsm/bin/payhsm-test
+src/lib/payhsm/bin/hsmctl
+demo_frag
+test_complet
+test_lmk_keys
+
+# Fichiers exemple AUTORISÉS (ne pas ignorer)
+!*.example
+!payhsm.conf.example

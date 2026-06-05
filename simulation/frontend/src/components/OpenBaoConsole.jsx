@@ -68,8 +68,12 @@ export default function OpenBaoConsole() {
   const refresh = useCallback(async () => {
     setBusy(true);
     setErr(null);
-    try { setData(await Api.openbaoCoffre()); }
-    catch (e) { setErr(e.message); setData(null); }
+    try {
+      if ((await Api.vault()).SWITCH_KEY_VAULT?.length === 0) {
+        await Api.switchInit().catch(() => {});
+      }
+      setData(await Api.openbaoCoffre());
+    } catch (e) { setErr(e.message); setData(null); }
     setBusy(false);
   }, []);
 

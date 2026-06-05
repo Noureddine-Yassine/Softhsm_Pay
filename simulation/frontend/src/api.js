@@ -36,6 +36,8 @@ export const Api = {
   vault: () => req('/api/vault'),
   openbaoStatus: () => req('/api/openbao/status'),
   openbaoCoffre: () => req('/api/openbao/coffre'),
+  switchInit: () => req('/api/switch/init', {}),
+  switchReset: () => req('/api/switch/reset', {}),
   switchProvision: (body = {}) => req('/api/switch/provision-keys', body),
   emvPurchase: (body) => req('/api/emv/purchase', body),
   macSign: (body) => req('/api/mac/sign', body),

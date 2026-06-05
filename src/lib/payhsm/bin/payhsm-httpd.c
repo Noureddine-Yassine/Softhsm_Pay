@@ -1,7 +1,9 @@
 /* Passerelle HTTP → libpayhsm (crypto C réel) + fichiers statiques frontend */
 #include "../payhsm_core.h"
 #include "../payhsm_switch.h"
+#include "../key_relation_validator.h"
 #include "../payhsm.h"
+#include "../payment/pin.h"          /* translate_pin_block — commandes CA/CB, CC/CD */
 #include "../keymanager/integrity.h"
 #include "../keymanager/xor_fragment.h"
 #include "../keymanager/shamir.h"
@@ -9,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <errno.h>
@@ -19,11 +22,17 @@
 #include <openssl/cmac.h>
 #include <openssl/rand.h>
 #include <openssl/evp.h>
+#include <openssl/ssl.h>     /* serveur TCP brut HSM optionnel en TLS */
 #include <time.h>
 #include <signal.h>
+#include <pthread.h>         /* serveur TCP brut HSM (thread séparé) + mutex dispatch */
 
 #define HTTP_BUF   65536
 #define AUDIT_MAX  128
+
+/* Définies dans payhsm-admin.c (inclus plus bas) */
+void payhsm_admin_reset_on_new_provision(const char *data_dir);
+void payhsm_admin_reload_after_startup(void);
 #define LMK_IV_LEN       12
 #define LMK_TAG_LEN      16
 #define LMK_KEY_LEN      16                              /* AES-128 (défaut / compatibilité) */
@@ -41,7 +50,14 @@ static int lmk_gcm_decrypt(const uint8_t lmk[32],
 /* Racine fichiers statiques (console HSM) — passer en 2e argument ou lancer depuis la racine du dépôt */
 #define STATIC_ROOT_DEFAULT "frontend"
 
-static char g_static_root[512] = STATIC_ROOT_DEFAULT;
+static char   g_static_root[512] = STATIC_ROOT_DEFAULT;
+/* Variables partagées avec payhsm-cmds.c */
+static time_t g_start_time  = 0;
+static int    g_server_port = 8765;
+
+/* Sérialise tout le traitement de commandes (HTTP /api/* + TCP brut) pour
+   protéger l'état global du HSM (coffre, fragments LMK) d'accès concurrents. */
+static pthread_mutex_t g_dispatch_lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
     time_t ts;
@@ -176,23 +192,56 @@ static void send_json(int fd, int code, const char *json) {
     http_reply(fd, code, "application/json; charset=utf-8", json);
 }
 
-static int read_request(int fd, char *buf, size_t cap) {
-    size_t n = 0;
-    while (n + 1 < cap) {
-        ssize_t r = recv(fd, buf + n, cap - n - 1, 0);
-        if (r <= 0) break;
-        n += (size_t)r;
-        buf[n] = '\0';
-        if (strstr(buf, "\r\n\r\n")) break;
-    }
-    return (int)n;
-}
-
 static int body_length(const char *hdr) {
     const char *p = strstr(hdr, "Content-Length:");
     if (!p) p = strstr(hdr, "content-length:");
     if (!p) return 0;
     return atoi(p + 15);
+}
+
+/*
+ * Lit une requête HTTP complète : en-têtes PUIS corps entier.
+ *
+ * L'ancienne version s'arrêtait dès "\r\n\r\n" et renvoyait souvent un corps
+ * vide quand le client (Python requests, Postman, navigateur) envoie le corps
+ * dans un paquet TCP séparé. On lit maintenant en deux temps :
+ *   1. jusqu'à la fin des en-têtes "\r\n\r\n" ;
+ *   2. exactement Content-Length octets de corps, en gérant le cas où une
+ *      partie du corps est déjà dans le buffer et les corps fragmentés.
+ *
+ * Retourne le nombre total d'octets lus (en-têtes + corps), borné par `cap`.
+ */
+static int read_request(int fd, char *buf, size_t cap) {
+    size_t n = 0;
+    char  *hdr_end = NULL;
+
+    /* 1. Lire jusqu'à la fin du bloc d'en-têtes. */
+    while (n + 1 < cap) {
+        ssize_t r = recv(fd, buf + n, cap - n - 1, 0);
+        if (r <= 0) break;
+        n += (size_t)r;
+        buf[n] = '\0';
+        hdr_end = strstr(buf, "\r\n\r\n");
+        if (hdr_end) break;
+    }
+    if (!hdr_end) return (int)n;   /* pas d'en-têtes complets : renvoyer ce qu'on a */
+
+    /* 2. Calculer combien d'octets de corps sont attendus. */
+    int clen = body_length(buf);
+    if (clen <= 0) return (int)n;  /* pas de corps (GET, ou Content-Length absent/0) */
+
+    size_t header_len = (size_t)(hdr_end - buf) + 4;   /* inclut le "\r\n\r\n" */
+    size_t want_total = header_len + (size_t)clen;
+    if (want_total >= cap) want_total = cap - 1;        /* anti-dépassement de buffer */
+
+    /* 3. Lire le reste du corps (peut arriver fragmenté). */
+    while (n < want_total) {
+        ssize_t r = recv(fd, buf + n, want_total - n, 0);
+        if (r <= 0) break;          /* déconnexion ou erreur : renvoyer ce qu'on a */
+        n += (size_t)r;
+        buf[n] = '\0';
+    }
+    return (int)n;
 }
 
 static const char *request_body(char *req) {
@@ -323,26 +372,7 @@ static void read_passphrase_json(const char *body, char *pass, size_t n) {
     if (pass[0] == '\0') json_field(body, "passphrase", pass, n);
 }
 
-static void api_provision(const char *body, char *out, size_t n) {
-    char dir[256] = {0};
-    json_field(body, "dataDir", dir, sizeof(dir));
-    if (!dir[0]) {
-        snprintf(out, n, "{\"rc\":-1,\"message\":\"Répertoire données manquant\"}");
-        return;
-    }
-    struct stat st_chk;
-    if (stat(dir, &st_chk) != 0) {
-        if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
-            snprintf(out, n, "{\"rc\":-1,\"message\":\"Impossible de créer le répertoire : %s\"}", strerror(errno));
-            return;
-        }
-    }
-    audit_log("Provision HSM — répertoire données créé/vérifié");
-    snprintf(out, n,
-        "{\"rc\":0,\"message\":\"Provisionnement réussi — répertoire données prêt."
-        " Initialisez la LMK dans le panneau LMK avant de démarrer.\","
-        "\"dataDir\":\"%s\"}", dir);
-}
+static void api_provision(const char *body, char *out, size_t n);
 
 static void api_keys_derive_terminal(const char *body, char *out, size_t n) {
     char tmk_gcm[96], term[64], tpk[36], tak[36], kcv_tpk[8], kcv_tak[8];
@@ -423,6 +453,32 @@ static void api_wrap_key(const char *body, char *out, size_t n) {
     audit_log(rc == 0 ? "Switch wrap-key OK (LMK GCM)" : "Switch wrap-key ECHEC");
 }
 
+/* A8 transport : ENC(LMK,key) → ENC(ZMK,key) — jamais de clé claire sur le réseau */
+static void api_key_exchange_export_under_zmk(const char *body, char *out, size_t n) {
+    if (!payhsm_ctx()->initialized) {
+        snprintf(out, n, "{\"rc\":-1,\"cmd\":\"A8\",\"message\":\"HSM non demarre\"}");
+        return;
+    }
+    char zmk_gcm[96], key_gcm[96];
+    json_field(body, "zmkCryptogram", zmk_gcm, sizeof(zmk_gcm));
+    json_field(body, "keyCryptogram", key_gcm, sizeof(key_gcm));
+    if (!zmk_gcm[0] || !key_gcm[0]) {
+        snprintf(out, n,
+            "{\"rc\":-1,\"cmd\":\"A8\","
+            "\"message\":\"zmkCryptogram et keyCryptogram (88 hex) requis\"}");
+        return;
+    }
+    char enc32[33], kcv[8];
+    int rc = payhsm_switch_wrap_lmk_gcm_under_zmk(zmk_gcm, key_gcm, enc32, kcv);
+    snprintf(out, n,
+             "{\"rc\":%d,\"cmd\":\"A8\",\"keyUnderZmk\":\"%s\",\"kcv\":\"%s\","
+             "\"message\":\"%s\"}",
+             rc, rc == 0 ? enc32 : "", rc == 0 ? kcv : "",
+             rc == 0 ? "Export sous ZMK (ECB 32 hex)" : "echec export transport");
+    if (rc == 0) audit_log("Key-exchange A8 export sous ZMK OK");
+    else audit_log("Key-exchange A8 export ECHEC");
+}
+
 static void api_wrap_zpk(const char *body, char *out, size_t n) {
     char zmk_gcm[96], keyhex[40], enc[36], kcv[8];
     json_field(body, "zmkCryptogram", zmk_gcm, sizeof(zmk_gcm));
@@ -452,6 +508,7 @@ static void api_startup(const char *body, char *out, size_t n) {
         return;
     }
     payhsm_emv_clear_session();
+    payhsm_admin_reload_after_startup();
     audit_log("Démarrage HSM — LMK fragmentée P1⊕P2⊕P3 déjà chargée");
     snprintf(out, n,
         "{\"rc\":0,\"message\":\"HSM démarré avec succès —"
@@ -528,11 +585,11 @@ static void api_gap(const char *body, char *out, size_t n) {
     char hex[20] = "";
     int rc = PAYHSM_RC_ERR;
 
-    char tmk_gcm[96], tpk_ecb[36];
+    char tmk_gcm[96], tpk_crypt[96];
     if (!err) {
         if (json_field(body, "tmkCryptogram", tmk_gcm, sizeof(tmk_gcm)) == 0 &&
-            json_field(body, "tpkCryptogram", tpk_ecb, sizeof(tpk_ecb)) == 0) {
-            rc = payhsm_gap_switch(tmk_gcm, tpk_ecb, pin, pan, pb);
+            json_field(body, "tpkCryptogram", tpk_crypt, sizeof(tpk_crypt)) == 0) {
+            rc = payhsm_gap_switch(tmk_gcm, tpk_crypt, pin, pan, pb);
         } else {
             err = "tmkCryptogram et tpkCryptogram requis (cles Switch)";
         }
@@ -555,7 +612,7 @@ static void api_gap(const char *body, char *out, size_t n) {
 }
 
 static void api_verify(const char *body, char *out, size_t n) {
-    char pan[32], hex[32], tmk_gcm[96], tpk_ecb[36], pvk_gcm[96], pvv[8];
+    char pan[32], hex[32], tmk_gcm[96], tpk_crypt[96], pvk_gcm[96], pvv[8];
     json_field(body, "pan",          pan,     sizeof(pan));
     json_field(body, "pinBlock",     hex,     sizeof(hex));
     json_field(body, "pvv",          pvv,     sizeof(pvv));  /* PVV fourni par le Core Banking */
@@ -567,9 +624,9 @@ static void api_verify(const char *body, char *out, size_t n) {
     }
     int rc = PAYHSM_RC_ERR;
     if (json_field(body, "tmkCryptogram", tmk_gcm, sizeof(tmk_gcm)) == 0 &&
-        json_field(body, "tpkCryptogram", tpk_ecb, sizeof(tpk_ecb)) == 0 &&
+        json_field(body, "tpkCryptogram", tpk_crypt, sizeof(tpk_crypt)) == 0 &&
         json_field(body, "pvkCryptogram", pvk_gcm, sizeof(pvk_gcm)) == 0)
-        rc = payhsm_verify_pin_switch(tmk_gcm, tpk_ecb, pvk_gcm, pan, pvv, pb, &vrc);
+        rc = payhsm_verify_pin_switch(tmk_gcm, tpk_crypt, pvk_gcm, pan, pvv, pb, &vrc);
     else
         rc = PAYHSM_RC_ERR;
     secure_zero(pb, sizeof(pb));
@@ -581,27 +638,49 @@ static void api_verify(const char *body, char *out, size_t n) {
 
 static void api_translate(const char *body, char *out, size_t n) {
     char hex[32], zpkId[48] = "ZPK-VISA";
-    char tmk_gcm[96], tpk_ecb[36], zmk_gcm[96], zpk_ecb[36];
+    char tmk_gcm[96], tpk_crypt[96], zmk_gcm[96], zpk_crypt[96];
     json_field(body, "pinBlock", hex, sizeof(hex));
     json_field(body, "zpkId", zpkId, sizeof(zpkId));
     json_field(body, "zmkCryptogram", zmk_gcm, sizeof(zmk_gcm));
-    json_field(body, "zpkCryptogram", zpk_ecb, sizeof(zpk_ecb));
+    json_field(body, "zpkCryptogram", zpk_crypt, sizeof(zpk_crypt));
     uint8_t in[8], pb[8];
     if (hex_decode(hex, in, 8) != 0) {
         snprintf(out, n, "{\"rc\":-1,\"message\":\"hex invalide\"}");
         return;
     }
     int rc = PAYHSM_RC_ERR;
-    if (json_field(body, "tmkCryptogram", tmk_gcm, sizeof(tmk_gcm)) == 0 &&
-        json_field(body, "tpkCryptogram", tpk_ecb, sizeof(tpk_ecb)) == 0 &&
-        zmk_gcm[0] && zpk_ecb[0])
-        rc = payhsm_translate_pin_switch(tmk_gcm, tpk_ecb, zmk_gcm, zpk_ecb, in, pb);
+    const char *errmsg = NULL;
+    if (json_field(body, "tmkCryptogram", tmk_gcm, sizeof(tmk_gcm)) != 0 ||
+        json_field(body, "tpkCryptogram", tpk_crypt, sizeof(tpk_crypt)) != 0)
+        errmsg = "tmkCryptogram et tpkCryptogram requis";
+    else if (!zmk_gcm[0])
+        errmsg = "zmkCryptogram requis";
+    else if (!zpk_crypt[0])
+        errmsg = "zpkCryptogram requis";
+    else {
+        size_t zpk_len = strlen(zpk_crypt);
+        size_t tpk_len = strlen(tpk_crypt);
+        if (zpk_len != 88 && zpk_len != 32)
+            errmsg = "zpkCryptogram tronque ou longueur invalide (attendu 88 ou 32 hex)";
+        else if (tpk_len != 88 && tpk_len != 32)
+            errmsg = "tpkCryptogram longueur invalide (attendu 88 ou 32 hex)";
+        else
+            rc = payhsm_translate_pin_switch(tmk_gcm, tpk_crypt, zmk_gcm, zpk_crypt, in, pb);
+    }
     char outhex[20] = "";
     if (rc == 0) hex_encode(pb, 8, outhex);
     secure_zero(in, sizeof(in));
     secure_zero(pb, sizeof(pb));
-    snprintf(out, n, "{\"rc\":%d,\"pinBlockZpk\":\"%s\",\"zpkId\":\"%s\"}",
-             rc, outhex, zpkId);
+    if (rc == 0)
+        snprintf(out, n, "{\"rc\":0,\"pinBlockZpk\":\"%s\",\"zpkId\":\"%s\"}",
+                 outhex, zpkId);
+    else
+        snprintf(out, n,
+                 "{\"rc\":%d,\"pinBlockZpk\":\"\",\"zpkId\":\"%s\","
+                 "\"message\":\"%s\"}",
+                 PAYHSM_RC_ERR, zpkId,
+                 errmsg ? errmsg :
+                 "Translation TPK→ZPK — verifier LMK demarree et cryptogrammes Switch");
     {
         char line[160];
         snprintf(line, sizeof(line), "%s — ZPK %s (pin.c translate)",
@@ -612,7 +691,7 @@ static void api_translate(const char *body, char *out, size_t n) {
 
 static void api_translate_zpk(const char *body, char *out, size_t n) {
     char hex[32], fromId[48], toId[48];
-    char zmk_gcm[96], zpk_a[36], zpk_b[36];
+    char zmk_gcm[96], zpk_a[96], zpk_b[96];
     json_field(body, "pinBlock", hex, sizeof(hex));
     json_field(body, "fromZpkId", fromId, sizeof(fromId));
     json_field(body, "toZpkId", toId, sizeof(toId));
@@ -655,12 +734,12 @@ static void api_verify_zpk(const char *body, char *out, size_t n) {
         snprintf(out, n, "{\"rc\":-1,\"message\":\"hex invalide\"}");
         return;
     }
-    char zmk_gcm[96], zpk_ecb[36], pvk_gcm[96];
+    char zmk_gcm[96], zpk_crypt[96], pvk_gcm[96];
     int rc = PAYHSM_RC_ERR;
     if (json_field(body, "zmkCryptogram", zmk_gcm, sizeof(zmk_gcm)) == 0 &&
-        json_field(body, "zpkCryptogram", zpk_ecb, sizeof(zpk_ecb)) == 0 &&
+        json_field(body, "zpkCryptogram", zpk_crypt, sizeof(zpk_crypt)) == 0 &&
         json_field(body, "pvkCryptogram", pvk_gcm, sizeof(pvk_gcm)) == 0)
-        rc = payhsm_verify_pin_zpk_switch(zmk_gcm, zpk_ecb, pvk_gcm, pan, pb, &vrc);
+        rc = payhsm_verify_pin_zpk_switch(zmk_gcm, zpk_crypt, pvk_gcm, pan, pb, &vrc);
     secure_zero(pb, sizeof(pb));
     const char *res = (vrc == PAYHSM_RC_OK) ? "APPROVED" : "DECLINED";
     int code = (vrc == PAYHSM_RC_OK) ? 0 : 55;
@@ -677,12 +756,86 @@ static void api_verify_zpk(const char *body, char *out, size_t n) {
     }
 }
 
-static void api_vault_list(char *out, size_t n) {
+/* Vide entièrement le coffre (clés sous LMK) et persiste sur disque.
+ * Utile pour purger des entrées de test périmées ou un coffre saturé.
+ * vault_clear() fait un memset qui efface aussi vault_path → on le sauvegarde
+ * et on le restaure avant vault_save(), sinon la persistance échoue. */
+static void api_vault_clear(char *out, size_t n) {
     if (!payhsm_ctx()->initialized) {
-        snprintf(out, n, "{\"rc\":%d,\"keys\":[]}", PAYHSM_RC_NOT_INIT);
+        snprintf(out, n, "{\"rc\":-1,\"message\":\"HSM non demarre — rien a vider\"}");
         return;
     }
-    int pos = snprintf(out, n, "{\"rc\":0,\"keys\":[");
+    payhsm_ctx_t *ctx = payhsm_ctx();
+    int removed_classic = ctx->vault.count;
+    int removed_ext = payhsm_ekm_clear_vault();
+    if (removed_ext < 0) removed_ext = 0;
+
+    char saved_path[256];
+    strncpy(saved_path, ctx->vault.vault_path, sizeof(saved_path) - 1);
+    saved_path[sizeof(saved_path) - 1] = '\0';
+
+    vault_clear(&ctx->vault);
+    strncpy(ctx->vault.vault_path, saved_path, sizeof(ctx->vault.vault_path) - 1);
+    ctx->vault.vault_path[sizeof(ctx->vault.vault_path) - 1] = '\0';
+    vault_save(&ctx->vault);
+
+    int removed = removed_classic + removed_ext;
+    {
+        char al[120];
+        snprintf(al, sizeof(al),
+                 "VAULT_CLEARED — keys.vault=%d ext_keys.vault=%d (total %d)",
+                 removed_classic, removed_ext, removed);
+        audit_log(al);
+    }
+    snprintf(out, n,
+        "{\"rc\":0,\"removed\":%d,\"removedClassic\":%d,\"removedExt\":%d,"
+        "\"message\":\"Coffre HSM vide — keys.vault=%d + ext_keys.vault=%d supprime(s). "
+        "Regenerez vos cles (NE/A4, A0, A8).\"}",
+        removed, removed_classic, removed_ext, removed_classic, removed_ext);
+}
+
+static int payhsm_ekm_append_vault_json(char *out, size_t n, int pos);
+
+/** GET /api/hsm/transport-gcm?transport=ZMK — blob GCM identique à A8/L */
+static void api_transport_gcm(const char *query, char *out, size_t n) {
+    if (!payhsm_ctx()->initialized) {
+        snprintf(out, n, "{\"rc\":%d,\"message\":\"HSM non demarre\"}", PAYHSM_RC_NOT_INIT);
+        return;
+    }
+    char transport[16] = "ZMK";
+    if (query) {
+        const char *p = strstr(query, "transport=");
+        if (p) {
+            p += 10;
+            size_t i = 0;
+            while (p[i] && p[i] != '&' && i < sizeof(transport) - 1) {
+                transport[i] = (char)toupper((unsigned char)p[i]);
+                i++;
+            }
+            transport[i] = '\0';
+        }
+    }
+    char crypt[89], tid[64];
+    if (payhsm_ekm_lookup_transport_by_name(transport, crypt, tid) != PAYHSM_RC_OK) {
+        snprintf(out, n,
+                 "{\"rc\":%d,\"message\":\"%s absente — cérémonie A4 (NE+A4) requise\"}",
+                 PAYHSM_RC_ERR, transport);
+        return;
+    }
+    snprintf(out, n,
+             "{\"rc\":0,\"transport\":\"%s\",\"keyId\":\"%s\","
+             "\"cryptogram\":\"%s\",\"source\":\"ext_keys.vault\"}",
+             transport, tid, crypt);
+}
+
+static void api_vault_list(char *out, size_t n) {
+    if (!payhsm_ctx()->initialized) {
+        snprintf(out, n, "{\"rc\":%d,\"keys\":[],\"message\":\"HSM non demarre\"}",
+                 PAYHSM_RC_NOT_INIT);
+        return;
+    }
+    int pos = snprintf(out, n, "{\"rc\":0,\"dataDir\":\"%s\",\"keys\":[",
+                       payhsm_ctx()->data_dir);
     for (int i = 0; i < payhsm_ctx()->vault.count && pos < (int)n - 120; i++) {
         const payhsm_key_entry_t *e = &payhsm_ctx()->vault.keys[i];
         char kcv[8];
@@ -690,10 +843,11 @@ static void api_vault_list(char *out, size_t n) {
                  e->kcv[0], e->kcv[1], e->kcv[2]);
         pos += snprintf(out + pos, n - (size_t)pos,
                         "%s{\"id\":\"%s\",\"type\":\"%s\",\"terminal\":\"%s\","
-                        "\"kcv\":\"%s\",\"storage\":\"chiffre/LMK\"}",
-                        i ? "," : "", e->id, key_type_name(e->type),
-                        e->terminal_id, kcv);
+                        "\"kcv\":\"%s\",\"storage\":\"keys.vault\"}",
+                        (pos > 0 && out[pos - 1] != '[') ? "," : "",
+                        e->id, key_type_name(e->type), e->terminal_id, kcv);
     }
+    pos = payhsm_ekm_append_vault_json(out, n, pos);
     snprintf(out + pos, n - (size_t)pos, "]}");
 }
 
@@ -1204,20 +1358,55 @@ static payhsm_key_type_t parse_key_type(const char *s) {
     return PAYHSM_KEY_ZMK;
 }
 
-/* Chiffre key (16 o) sous LMK ECB et l'ajoute au vault — appelé depuis A0/A6/A8 */
-static void vault_store_16(const uint8_t lmk32[32],
-                           const uint8_t key16[PAYHSM_KEY_LEN],
-                           const char *keytype, const char *terminal_id,
-                           const char *kcv6hex) {
+/*
+ * Convertit un code type 2 caractères du format wire INTERNAL (01..07)
+ * en nom de clé ("TMK", "ZMK"...). Aligné sur KEY_CODE_MAP de payhsm-admin.c
+ * et sur l'exemple documenté dans docs/commands.md (0001A01001U → type 01 = TMK).
+ *
+ * Sans cette conversion, le code hex est passé tel quel à parse_key_type()
+ * qui attend un nom, échoue à matcher, et stocke tout en ZMK par défaut.
+ *
+ * Retourne le nom mappé, ou la chaîne d'origine si c'est déjà un nom
+ * (ZMK/ZPK...) ou un code inconnu — parse_key_type() gère alors le fallback.
+ */
+static const char *keytype_hex_to_name(const char *code2) {
+    if (!code2) return "ZMK";
+    if (!strcmp(code2,"01")) return "TMK";
+    if (!strcmp(code2,"02")) return "ZMK";
+    if (!strcmp(code2,"03")) return "ZPK";
+    if (!strcmp(code2,"04")) return "PVK";
+    if (!strcmp(code2,"05")) return "IMK";
+    if (!strcmp(code2,"06")) return "TPK";
+    if (!strcmp(code2,"07")) return "TAK";
+    return code2;
+}
+
+/* Chiffre key (16 o) sous LMK ECB et l'ajoute au vault — appelé depuis A0/A6/A8.
+ * Retourne 0 si la clé a été ajoutée/mise à jour, -1 sinon (chiffrement échoué
+ * ou coffre plein). L'échec « coffre plein » est audité pour ne plus être
+ * silencieux : sans cela une nouvelle clé semble générée mais n'apparaît jamais. */
+static int vault_store_16(const uint8_t lmk32[32],
+                          const uint8_t key16[PAYHSM_KEY_LEN],
+                          const char *keytype, const char *terminal_id,
+                          const char *kcv6hex) {
     uint8_t enc[PAYHSM_KEY_LEN], kcv_bytes[3];
-    if (vault_encrypt_under_lmk(lmk32, key16, enc) != 0) return;
+    if (vault_encrypt_under_lmk(lmk32, key16, enc) != 0) return -1;
     hex_decode(kcv6hex, kcv_bytes, 3);
     char key_id[48];
     snprintf(key_id, sizeof(key_id), "%s-%s", keytype, kcv6hex);
     payhsm_ctx_t *ctx = payhsm_ctx();
-    vault_add_key(&ctx->vault, key_id, parse_key_type(keytype),
-                  terminal_id ? terminal_id : "", enc, kcv_bytes);
+    int rc = vault_add_key(&ctx->vault, key_id, parse_key_type(keytype),
+                           terminal_id ? terminal_id : "", enc, kcv_bytes);
+    if (rc != 0) {
+        char al[96];
+        snprintf(al, sizeof(al),
+                 "VAULT_FULL — cle %s NON stockee (coffre plein: %d/%d)",
+                 key_id, ctx->vault.count, PAYHSM_MAX_KEYS);
+        audit_log(al);
+        return -1;
+    }
     vault_save(&ctx->vault);
+    return 0;
 }
 
 /*
@@ -1268,11 +1457,13 @@ static void api_hsm_a0(const char *body, char *out, size_t n) {
     uint8_t blob[LMK_MAX_BLOB_LEN];
     int rc = lmk_gcm_encrypt_n(lmk, key, keylen, blob);
 
-    /* Vault storage: persist 16-byte keys under LMK (ECB) while lmk is available */
+    /* Vault storage: persist 16-byte keys under LMK (ECB) while lmk is available.
+       vault_full=1 si le coffre est plein (clé générée mais non stockée). */
     char kcv[7];
     hsm_kcv_hex(key, keylen, kcv);
+    int vault_full = 0;
     if (rc == 0 && keylen == PAYHSM_KEY_LEN)
-        vault_store_16(lmk, key, keytype, "", kcv);
+        vault_full = (vault_store_16(lmk, key, keytype, "", kcv) != 0);
 
     secure_zero(lmk, sizeof(lmk));
     if (rc != 0) {
@@ -1290,10 +1481,15 @@ static void api_hsm_a0(const char *body, char *out, size_t n) {
     snprintf(out, n,
         "{\"rc\":0,\"cmd\":\"A0\",\"keyType\":\"%s\","
         "\"scheme\":\"U\",\"cryptogram\":\"%s\",\"kcv\":\"%s\","
-        "\"keyLen\":%u,"
-        "\"message\":\"Cle generee et protegee sous LMK (AES-256-GCM)\","
+        "\"keyLen\":%u,\"vaultStored\":%s,"
+        "\"message\":\"%s\","
         "\"hint\":\"Cryptogramme = IV(12)+TAG(16)+CT(%u) = %zu chars hex\"}",
-        tesc, blobhex, kcv, keylen, keylen, blob_len * 2);
+        tesc, blobhex, kcv, keylen,
+        (keylen == PAYHSM_KEY_LEN && !vault_full) ? "true" : "false",
+        vault_full
+            ? "Cle generee mais NON stockee — coffre plein (32 cles max). Videz le coffre."
+            : "Cle generee et protegee sous LMK (AES-256-GCM)",
+        keylen, blob_len * 2);
     {
         char line[128];
         snprintf(line, sizeof(line), "A0 Generate Key: type=%s keylen=%u KCV=%s",
@@ -1397,6 +1593,39 @@ static void api_hsm_a6(const char *body, char *out, size_t n) {
     }
 }
 
+/* A6 + verification KCV optionnelle (key-exchange) */
+static void api_key_exchange_import(const char *body, char *out, size_t n) {
+    char kcv_expected[16] = "";
+    json_field(body, "kcvExpected", kcv_expected, sizeof(kcv_expected));
+    api_hsm_a6(body, out, n);
+    if (!kcv_expected[0]) return;
+    if (strstr(out, "\"rc\":0") == NULL) return;
+    char kcv_got[16] = "";
+    const char *p = strstr(out, "\"kcv\":\"");
+    if (p) {
+        p += 7;
+        size_t i = 0;
+        while (p[i] && p[i] != '"' && i < 15) {
+            kcv_got[i] = (char)toupper((unsigned char)p[i]);
+            i++;
+        }
+        kcv_got[i] = '\0';
+    }
+    char exp_up[16];
+    size_t el = strlen(kcv_expected);
+    for (size_t i = 0; i < el && i < 15; i++)
+        exp_up[i] = (char)toupper((unsigned char)kcv_expected[i]);
+    exp_up[el < 15 ? el : 15] = '\0';
+    if (kcv_got[0] && strcmp(kcv_got, exp_up) != 0) {
+        snprintf(out, n,
+            "{\"rc\":-1,\"cmd\":\"A6\",\"errorCode\":\"07\","
+            "\"message\":\"KCV mismatch apres import\","
+            "\"kcvExpected\":\"%s\",\"kcvComputed\":\"%s\"}",
+            exp_up, kcv_got);
+        audit_log("Key-exchange A6 KCV mismatch");
+    }
+}
+
 /*
  * A8 — Consultation temporaire d'une clé protégée sous LMK
  *
@@ -1483,293 +1712,39 @@ static void api_hsm_a8(const char *body, char *out, size_t n) {
     }
 }
 
+/* ── Module commandes additionnelles B2/NO/NI/NC/N0/BU ── */
+#include "payhsm-cmds.c"
+
+/* ── Module gestion des clés payShield 10K ── */
+#include "payhsm-keymgr.c"
+
+/* ── Registre commandes + dispatcher unifié (modes INTERNAL/PAYSHIELD/LAB) ── */
+#include "payhsm-cmd-table.c"
+
 /*
- * api_hsm_cmd_raw — Protocole binaire/hex style Thales payShield 10K
+ * api_hsm_cmd_raw — Wrapper mince → CommandRegistry + hsm_dispatch_wire()
  *
- * Commandes supportées :
- *
- *   A0  Générer une clé et la protéger sous LMK → réponse A1
- *       Format : [HDR:4][A0][KEYLEN:2][KEYTYPE:2][SCHEMA:1]
- *       Exemple: 0001A01001U
- *       Réponse: [HDR][A1][STATUS:2][SCHEMA:1][CLE_LMK:88][KCV:6]
- *
- *   A6  Importer une clé externe chiffrée sous ZMK → rechiffrer sous LMK → réponse A7
- *       Format : [HDR:4][A6][KEYTYPE:2][SCHEMA_ZMK:1][ZMK_ENC:88][SCHEMA_KEY:1][KEY_ENC:32]
- *       Total  : 130 chars
- *       Réponse: [HDR][A7][STATUS:2][SCHEMA:1][CLE_LMK:88][KCV:6]
- *
- *   A8  Consultation temporaire d'une clé sous LMK → calcul KCV → réponse A9
- *       Format : [HDR:4][A8][KEYLEN:2][FLAG:1][KEY_ENC:88]
- *       FLAG=H : KCV seulement ; FLAG=V : clé claire + KCV
- *       Total  : 97 chars
- *       Réponse: [HDR][A9][STATUS:2][KEYLEN:2][CLE_CLAIRE si V][KCV:6]
- *
- * Schéma "U" = AES-256-GCM 88-char blob (IV:12 + TAG:16 + CT:16 octets)
- * KCV        = 3DES-ECB sur 8 zéros, 3 premiers octets (6 hex chars)
+ * Modes disponibles via POST /api/hsm/mode :
+ *   INTERNAL        — formats pipe-étendus du projet (défaut, rétrocompatible)
+ *   PAYSHIELD_COMPAT — inspiré payShield 10K [PS-INSPIRED, non officiel]
+ *   LAB             — INTERNAL + A8 flag V autorisé (interdit en production)
  */
 static void api_hsm_cmd_raw(const char *body, char *out, size_t n) {
-    char cmd_str[256];
+    char cmd_str[512];
     cmd_str[0] = '\0';
     json_field(body, "cmd", cmd_str, sizeof(cmd_str));
 
     size_t cmdlen = strlen(cmd_str);
     if (cmdlen < 6) {
         snprintf(out, n,
-            "{\"rc\":-1,\"message\":\"Commande HSM trop courte (min 6 chars)\","
-            "\"format\":\"[HDR:4][CMD:2][...] — ex: 0001A01001U\"}");
+            "{\"rc\":-1,\"errorCode\":\"02\","
+            "\"message\":\"Trame trop courte (min 6 chars): [HDR:4][CMD:2][...]\"}");
         return;
     }
 
-    char hdr[5], cmdcode[3];
-    strncpy(hdr, cmd_str, 4);     hdr[4]     = '\0';
-    strncpy(cmdcode, cmd_str + 4, 2); cmdcode[2] = '\0';
-    /* normaliser en majuscules */
-    for (int i = 0; cmdcode[i]; i++)
-        if (cmdcode[i] >= 'a' && cmdcode[i] <= 'z') cmdcode[i] -= 32;
-
-    /* buffers pour la réponse brute et les champs JSON additionnels */
-    char raw_resp[256]  = "";
-    char json_extra[512] = "";
-
-    /* ------------------------------------------------------------------ */
-    /* A0 : génération de clé                                              */
-    /* ------------------------------------------------------------------ */
-    if (strcmp(cmdcode, "A0") == 0) {
-        /* [HDR:4][A0][KEYLEN:2][KEYTYPE:2][SCHEMA:1] = 11 chars minimum */
-        if (cmdlen < 11) {
-            snprintf(out, n,
-                "{\"rc\":-1,\"rawResponse\":\"%sA1FF\","
-                "\"message\":\"A0: format invalide — 11 chars min: 0001A01001U\"}", hdr);
-            return;
-        }
-        if (!payhsm_ctx()->initialized) {
-            snprintf(out, n,
-                "{\"rc\":-1,\"rawResponse\":\"%sA1FF\",\"message\":\"HSM non demarre\"}", hdr);
-            return;
-        }
-
-        char keylen_hex[3], keytype_hex[3], schema[2];
-        strncpy(keylen_hex,  cmd_str + 6, 2);  keylen_hex[2]  = '\0';
-        strncpy(keytype_hex, cmd_str + 8, 2);  keytype_hex[2] = '\0';
-        schema[0] = cmd_str[10]; schema[1] = '\0';
-        if (schema[0] >= 'a' && schema[0] <= 'z') schema[0] -= 32;
-
-        unsigned int keylen_val = 0;
-        sscanf(keylen_hex, "%2x", &keylen_val);
-        if (keylen_val != 16 && keylen_val != 24 && keylen_val != 32) {
-            snprintf(out, n,
-                "{\"rc\":-1,\"rawResponse\":\"%sA1FF\","
-                "\"message\":\"A0: taille cle non supportee — valeurs valides: "
-                "0x10 (16/AES-128), 0x18 (24/AES-192), 0x20 (32/AES-256)\"}", hdr);
-            return;
-        }
-
-        /* Générer keylen_val octets aléatoires avec RAND_bytes (jamais fake_random) */
-        uint8_t key[LMK_MAX_KEY_LEN];
-        if (RAND_bytes(key, (int)keylen_val) != 1) {
-            snprintf(out, n,
-                "{\"rc\":-1,\"rawResponse\":\"%sA1FF\",\"message\":\"RAND_bytes echec\"}", hdr);
-            return;
-        }
-
-        /* Chiffrer sous LMK (AES-256-GCM, longueur variable) */
-        uint8_t lmk[32];
-        if (check_integrity() != 0 || recompose_for_op(lmk) != 0) {
-            secure_zero(key, sizeof(key));
-            snprintf(out, n,
-                "{\"rc\":-1,\"rawResponse\":\"%sA1FF\",\"message\":\"LMK indisponible\"}", hdr);
-            return;
-        }
-        size_t blob_len = LMK_BLOB_OVERHEAD + keylen_val;
-        uint8_t blob[LMK_MAX_BLOB_LEN];
-        int rc = lmk_gcm_encrypt_n(lmk, key, keylen_val, blob);
-        secure_zero(lmk, sizeof(lmk));
-        if (rc != 0) {
-            secure_zero(key, sizeof(key));
-            snprintf(out, n,
-                "{\"rc\":-1,\"rawResponse\":\"%sA1FF\",\"message\":\"Chiffrement GCM echec\"}", hdr);
-            return;
-        }
-
-        char blobhex[LMK_MAX_BLOB_LEN * 2 + 1];
-        char kcv[7];
-        hex_encode(blob, blob_len, blobhex);
-        hsm_kcv_hex(key, keylen_val, kcv);
-        secure_zero(key, sizeof(key));
-
-        /* Réponse A1 : [HDR][A1][00][SCHEMA][BLOB_HEX][KCV6] */
-        snprintf(raw_resp, sizeof(raw_resp), "%sA100%s%s%s", hdr, schema, blobhex, kcv);
-        snprintf(json_extra, sizeof(json_extra),
-            ",\"kcv\":\"%s\",\"cryptogram\":\"%s\","
-            "\"keyLen\":%u,\"keyType\":\"%s\",\"schema\":\"%s\","
-            "\"hint\":\"cryptogram = IV(12)+TAG(16)+CT(%u) = %zu chars hex\"",
-            kcv, blobhex, keylen_val, keytype_hex, schema,
-            keylen_val, blob_len * 2);
-        {
-            char line[128];
-            snprintf(line, sizeof(line),
-                "A0 RAW: keytype=%s schema=%s keylen=%u KCV=%s",
-                keytype_hex, schema, keylen_val, kcv);
-            audit_log(line);
-        }
-
-    /* ------------------------------------------------------------------ */
-    /* A6 : importation de clé sous ZMK → LMK                             */
-    /* ------------------------------------------------------------------ */
-    } else if (strcmp(cmdcode, "A6") == 0) {
-        /*
-         * [HDR:4][A6][KEYTYPE:2][SCHEMA_ZMK:1][ZMK_ENC:88][SCHEMA_KEY:1][KEY_ENC:32]
-         * Offset :  0    4    6        8             9              97          98
-         * Total  : 130 chars
-         */
-        if (cmdlen < 130) {
-            snprintf(out, n,
-                "{\"rc\":-1,\"rawResponse\":\"%sA7FF\","
-                "\"message\":\"A6: longueur invalide — 130 chars attendus\","
-                "\"format\":\"[HDR:4][A6][KEYTYPE:2][SCHEMA_ZMK:1][ZMK88][SCHEMA_KEY:1][KEY32]\"}", hdr);
-            return;
-        }
-        if (!payhsm_ctx()->initialized) {
-            snprintf(out, n,
-                "{\"rc\":-1,\"rawResponse\":\"%sA7FF\",\"message\":\"HSM non demarre\"}", hdr);
-            return;
-        }
-
-        char keytype_hex[3], key_schema[2];
-        char zmk_enc[89], key_enc[33];
-        strncpy(keytype_hex, cmd_str + 6,  2); keytype_hex[2] = '\0';
-        /* cmd_str[8] = SCHEMA_ZMK (informatif — non utilisé dans la réponse) */
-        strncpy(zmk_enc,     cmd_str + 9,  88); zmk_enc[88]   = '\0';
-        key_schema[0] = cmd_str[97];            key_schema[1] = '\0';
-        strncpy(key_enc,     cmd_str + 98, 32); key_enc[32]   = '\0';
-
-        /* Étape 1 : déchiffrer ZMK depuis LMK */
-        uint8_t zmk[LMK_KEY_LEN];
-        if (payhsm_unwrap_lmk_gcm_hex(zmk_enc, zmk) != PAYHSM_RC_OK) {
-            snprintf(out, n,
-                "{\"rc\":-1,\"rawResponse\":\"%sA7FF\","
-                "\"message\":\"A6: dechiffrement ZMK echec\"}", hdr);
-            return;
-        }
-
-        /* Étape 2 : déchiffrer clé importée sous ZMK (AES-128-ECB) */
-        uint8_t key_clear[LMK_KEY_LEN];
-        int rc2 = payhsm_unwrap_ecb_hex(zmk, key_enc, key_clear);
-        secure_zero(zmk, sizeof(zmk));
-        if (rc2 != PAYHSM_RC_OK) {
-            snprintf(out, n,
-                "{\"rc\":-1,\"rawResponse\":\"%sA7FF\","
-                "\"message\":\"A6: dechiffrement cle sous ZMK echec\"}", hdr);
-            return;
-        }
-
-        /* Étape 3 : rechiffrer sous LMK (AES-256-GCM) */
-        char new_blob[PAYHSM_GCM_BLOB_HEX + 2];
-        if (payhsm_wrap_lmk_gcm_hex(key_clear, new_blob) != PAYHSM_RC_OK) {
-            secure_zero(key_clear, sizeof(key_clear));
-            snprintf(out, n,
-                "{\"rc\":-1,\"rawResponse\":\"%sA7FF\","
-                "\"message\":\"A6: chiffrement LMK echec\"}", hdr);
-            return;
-        }
-
-        /* Étape 4 : KCV + zéroïsation */
-        char kcv[7];
-        hsm_kcv_hex(key_clear, LMK_KEY_LEN, kcv);
-        secure_zero(key_clear, sizeof(key_clear));
-
-        /* Réponse A7 : [HDR][A7][00][SCHEMA_KEY][BLOB88][KCV6] */
-        snprintf(raw_resp, sizeof(raw_resp), "%sA700%s%s%s", hdr, key_schema, new_blob, kcv);
-        snprintf(json_extra, sizeof(json_extra),
-            ",\"kcv\":\"%s\",\"cryptogram\":\"%s\","
-            "\"keyType\":\"%s\",\"schema\":\"%s\","
-            "\"hint\":\"cryptogram = cle importee rechiffree sous LMK locale\"",
-            kcv, new_blob, keytype_hex, key_schema);
-        {
-            char line[128];
-            snprintf(line, sizeof(line),
-                "A6 RAW import: keytype=%s KCV=%s (ZMK→LMK)", keytype_hex, kcv);
-            audit_log(line);
-        }
-
-    /* ------------------------------------------------------------------ */
-    /* A8 : consultation temporaire d'une clé — calcul KCV                */
-    /* ------------------------------------------------------------------ */
-    } else if (strcmp(cmdcode, "A8") == 0) {
-        /*
-         * [HDR:4][A8][KEYLEN:2][FLAG:1][KEY_ENC:88]
-         * Offset :  0    4    6       8         9
-         * Total  : 97 chars
-         */
-        if (cmdlen < 97) {
-            snprintf(out, n,
-                "{\"rc\":-1,\"rawResponse\":\"%sA9FF\","
-                "\"message\":\"A8: longueur invalide — 97 chars attendus\","
-                "\"format\":\"[HDR:4][A8][KEYLEN:2][FLAG:1][KEY88]\"}", hdr);
-            return;
-        }
-        if (!payhsm_ctx()->initialized) {
-            snprintf(out, n,
-                "{\"rc\":-1,\"rawResponse\":\"%sA9FF\",\"message\":\"HSM non demarre\"}", hdr);
-            return;
-        }
-
-        char keylen_hex[3], flag[2], key_enc[89];
-        strncpy(keylen_hex, cmd_str + 6,  2); keylen_hex[2] = '\0';
-        flag[0] = cmd_str[8];                 flag[1]       = '\0';
-        if (flag[0] >= 'a' && flag[0] <= 'z') flag[0] -= 32;
-        strncpy(key_enc, cmd_str + 9, 88);    key_enc[88]   = '\0';
-
-        /* Étape 1 : déchiffrer temporairement la clé depuis LMK */
-        uint8_t key_clear[LMK_KEY_LEN];
-        if (payhsm_unwrap_lmk_gcm_hex(key_enc, key_clear) != PAYHSM_RC_OK) {
-            snprintf(out, n,
-                "{\"rc\":-1,\"rawResponse\":\"%sA9FF\","
-                "\"message\":\"A8: dechiffrement LMK echec\"}", hdr);
-            return;
-        }
-
-        /* Étape 2 : KCV (3DES-ECB sur 8 zéros) */
-        char kcv[7];
-        hsm_kcv_hex(key_clear, LMK_KEY_LEN, kcv);
-
-        if (flag[0] == 'V') {
-            /* Réponse A9 flag V : [HDR][A9][00][KEYLEN][CLE_CLAIRE:32][KCV:6] */
-            char keyhex[LMK_KEY_LEN * 2 + 1];
-            hex_encode(key_clear, LMK_KEY_LEN, keyhex);
-            secure_zero(key_clear, sizeof(key_clear));
-            snprintf(raw_resp, sizeof(raw_resp),
-                "%sA900%s%s%s", hdr, keylen_hex, keyhex, kcv);
-            snprintf(json_extra, sizeof(json_extra),
-                ",\"flag\":\"V\",\"kcv\":\"%s\",\"keyClear\":\"%s\","
-                "\"keyLen\":16,\"warning\":\"Cle en clair retournee — usage maintenance\"",
-                kcv, keyhex);
-        } else {
-            /* Réponse A9 flag H : [HDR][A9][00][KEYLEN][KCV:6] */
-            secure_zero(key_clear, sizeof(key_clear));
-            snprintf(raw_resp, sizeof(raw_resp),
-                "%sA900%s%s", hdr, keylen_hex, kcv);
-            snprintf(json_extra, sizeof(json_extra),
-                ",\"flag\":\"H\",\"kcv\":\"%s\",\"keyLen\":16,"
-                "\"message\":\"KCV uniquement — cle non revelee\"",
-                kcv);
-        }
-        {
-            char line[128];
-            snprintf(line, sizeof(line),
-                "A8 RAW consult: flag=%s KCV=%s%s",
-                flag, kcv, flag[0] == 'V' ? " [CLE EN CLAIR]" : "");
-            audit_log(line);
-        }
-
-    } else {
-        snprintf(out, n,
-            "{\"rc\":-1,\"message\":\"Commande HSM inconnue: %s — commandes supportees: A0, A6, A8\"}",
-            cmdcode);
-        return;
-    }
-
-    snprintf(out, n, "{\"rc\":0,\"rawResponse\":\"%s\"%s}", raw_resp, json_extra);
+    char hdr[5];
+    strncpy(hdr, cmd_str, 4); hdr[4] = '\0';
+    hsm_dispatch_wire(hdr, cmd_str, cmdlen, out, n);
 }
 
 /* ── MK / Shamir Secret Sharing (2 étapes séparées) ── */
@@ -1932,6 +1907,7 @@ static void api_lmk_init_trng(const char *body, char *out, size_t n) {
         return;
     }
 
+    payhsm_admin_reload_after_startup();
     audit_log("TRNG: MK chargée depuis mk.bin — LMK fragmentée P1/P2/P3");
     char esc_dir[256];
     json_escape(dir, esc_dir, sizeof(esc_dir));
@@ -1998,11 +1974,17 @@ static void api_shamir_generate(const char *body, char *out, size_t n) {
     }
     secure_zero(mk, sizeof(mk));
 
-    /* Sauvegarder les 3 fichiers de parts */
+    /* Répertoire de sortie des .sss (optionnel — mk.bin reste dans dataDir) */
+    char share_dir[256];
+    json_field(body, "shareDir", share_dir, sizeof(share_dir));
+    if (!share_dir[0])
+        snprintf(share_dir, sizeof(share_dir), "%s", dir);
+    mkdir(share_dir, 0700);
+
     char sp1[512], sp2[512], sp3[512];
-    snprintf(sp1, sizeof(sp1), "%s/" SHARE1_FILE, dir);
-    snprintf(sp2, sizeof(sp2), "%s/" SHARE2_FILE, dir);
-    snprintf(sp3, sizeof(sp3), "%s/" SHARE3_FILE, dir);
+    snprintf(sp1, sizeof(sp1), "%s/" SHARE1_FILE, share_dir);
+    snprintf(sp2, sizeof(sp2), "%s/" SHARE2_FILE, share_dir);
+    snprintf(sp3, sizeof(sp3), "%s/" SHARE3_FILE, share_dir);
 
     int err = (share_save(sp1, shares[0]) != 0 ||
                share_save(sp2, shares[1]) != 0 ||
@@ -2016,12 +1998,14 @@ static void api_shamir_generate(const char *body, char *out, size_t n) {
     }
 
     audit_log("Shamir: 3 parts LMK générées → lmk_share_1.sss, lmk_share_2.sss, lmk_share_3.sss");
+    char esc_share[256];
+    json_escape(share_dir, esc_share, sizeof(esc_share));
     snprintf(out, n,
         "{\"rc\":0,"
         "\"message\":\"Les 3 parts SSS ont été générées et stockées avec succès.\","
         "\"files\":[\"" SHARE1_FILE "\",\"" SHARE2_FILE "\",\"" SHARE3_FILE "\"],"
-        "\"dataDir\":\"%s\",\"threshold\":\"3/3\"}",
-        dir);
+        "\"dataDir\":\"%s\",\"shareDir\":\"%s\",\"threshold\":\"3/3\"}",
+        dir, esc_share);
 }
 
 /* ── Étape 2 : Reconstruction MK depuis les 3 parts + init HSM ── */
@@ -2037,42 +2021,45 @@ static void api_shamir_reconstruct(const char *body, char *out, size_t n) {
 
     uint8_t shares[3][SHAMIR_SHARE_LEN];
     int from_files = 0;
+    int from_upload = 0;
 
-    /* Priorité 1 : lire les fichiers lmk_share_*.sss */
-    char sp1[512], sp2[512], sp3[512];
-    snprintf(sp1, sizeof(sp1), "%s/" SHARE1_FILE, dir);
-    snprintf(sp2, sizeof(sp2), "%s/" SHARE2_FILE, dir);
-    snprintf(sp3, sizeof(sp3), "%s/" SHARE3_FILE, dir);
-
-    if (file_exists(sp1) && file_exists(sp2) && file_exists(sp3)) {
-        if (share_load(sp1, shares[0]) == 0 &&
-            share_load(sp2, shares[1]) == 0 &&
-            share_load(sp3, shares[2]) == 0)
-            from_files = 1;
+    /* Priorité 1 : parts envoyées par l'UI (fichiers choisis dans le navigateur) */
+    {
+        char s1[SHAMIR_SHARE_HEX], s2[SHAMIR_SHARE_HEX], s3[SHAMIR_SHARE_HEX];
+        if (json_field(body, "share1", s1, sizeof(s1)) == 0 &&
+            json_field(body, "share2", s2, sizeof(s2)) == 0 &&
+            json_field(body, "share3", s3, sizeof(s3)) == 0 &&
+            strlen(s1) == 66 && strlen(s2) == 66 && strlen(s3) == 66) {
+            if (hex_decode(s1, shares[0], SHAMIR_SHARE_LEN) == 0 &&
+                hex_decode(s2, shares[1], SHAMIR_SHARE_LEN) == 0 &&
+                hex_decode(s3, shares[2], SHAMIR_SHARE_LEN) == 0)
+                from_upload = 1;
+        }
     }
 
-    /* Priorité 2 : parts fournies manuellement dans le corps */
-    if (!from_files) {
-        char s1[SHAMIR_SHARE_HEX], s2[SHAMIR_SHARE_HEX], s3[SHAMIR_SHARE_HEX];
-        if (json_field(body, "share1", s1, sizeof(s1)) != 0 ||
-            json_field(body, "share2", s2, sizeof(s2)) != 0 ||
-            json_field(body, "share3", s3, sizeof(s3)) != 0) {
-            snprintf(out, n,
-                "{\"rc\":-1,\"message\":\"Parts SSS introuvables — "
-                "fichiers admin*_share.sss absents et share1/share2/share3 manquants\"}");
-            return;
+    /* Priorité 2 : lire lmk_share_*.sss sur disque (shareDir optionnel, sinon dataDir) */
+    if (!from_upload) {
+        char share_dir[256] = {0};
+        json_field(body, "shareDir", share_dir, sizeof(share_dir));
+        const char *scan = share_dir[0] ? share_dir : dir;
+        char sp1[512], sp2[512], sp3[512];
+        snprintf(sp1, sizeof(sp1), "%s/" SHARE1_FILE, scan);
+        snprintf(sp2, sizeof(sp2), "%s/" SHARE2_FILE, scan);
+        snprintf(sp3, sizeof(sp3), "%s/" SHARE3_FILE, scan);
+
+        if (file_exists(sp1) && file_exists(sp2) && file_exists(sp3)) {
+            if (share_load(sp1, shares[0]) == 0 &&
+                share_load(sp2, shares[1]) == 0 &&
+                share_load(sp3, shares[2]) == 0)
+                from_files = 1;
         }
-        if (strlen(s1) != 66 || strlen(s2) != 66 || strlen(s3) != 66) {
-            snprintf(out, n,
-                "{\"rc\":-1,\"message\":\"parts invalides — 66 hex chars requis par part\"}");
-            return;
-        }
-        if (hex_decode(s1, shares[0], SHAMIR_SHARE_LEN) != 0 ||
-            hex_decode(s2, shares[1], SHAMIR_SHARE_LEN) != 0 ||
-            hex_decode(s3, shares[2], SHAMIR_SHARE_LEN) != 0) {
-            snprintf(out, n, "{\"rc\":-1,\"message\":\"décodage hex parts échoué\"}");
-            return;
-        }
+    }
+
+    if (!from_upload && !from_files) {
+        snprintf(out, n,
+            "{\"rc\":-1,\"message\":\"Parts SSS introuvables — "
+            "sélectionnez les 3 fichiers .sss ou placez-les dans shareDir/dataDir\"}");
+        return;
     }
 
     uint8_t mk[32];
@@ -2094,17 +2081,67 @@ static void api_shamir_reconstruct(const char *body, char *out, size_t n) {
         return;
     }
 
-    const char *src = from_files ? "fichiers admin*_share.sss" : "parts manuelles";
+    payhsm_admin_reload_after_startup();
+    const char *src = from_upload ? "fichiers UI (upload)"
+                    : (from_files ? "fichiers lmk_share_*.sss" : "parts");
     audit_log("Shamir: MK reconstituée (3/3) — HSM initialisé, LMK fragmentée P1/P2/P3");
     char esc_dir[256];
     json_escape(dir, esc_dir, sizeof(esc_dir));
     snprintf(out, n,
-        "{\"rc\":0,\"message\":\"MK reconstituée — HSM initialisé. LMK fragmentée en P1/P2/P3\","
+        "{\"rc\":0,\"message\":\"MK reconstituée — HSM initialisé. LMK fragmentée en P1/P2/P3."
+        " Si le Switch était provisionné pour cette LMK, son état est restauré depuis switch_state.bin.\","
         "\"source\":\"%s\",\"dataDir\":\"%s\",\"initialized\":1}",
         src, esc_dir);
 }
 
-static void dispatch_api(const char *path, const char *body, char *out, size_t n) {
+/* ── Module administration Switch/ATM (inclus en compilation unique) ── */
+#include "payhsm-admin.c"
+
+static void provision_unlink(const char *dir, const char *name) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    unlink(path);
+}
+
+/* Provision = nouvel HSM : arrêt, effacement artefacts LMK/coffre/Switch admin */
+static void api_provision(const char *body, char *out, size_t n) {
+    char dir[256] = {0};
+    json_field(body, "dataDir", dir, sizeof(dir));
+    if (!dir[0]) {
+        snprintf(out, n, "{\"rc\":-1,\"message\":\"Répertoire données manquant\"}");
+        return;
+    }
+    struct stat st_chk;
+    if (stat(dir, &st_chk) != 0) {
+        if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+            snprintf(out, n, "{\"rc\":-1,\"message\":\"Impossible de créer le répertoire : %s\"}", strerror(errno));
+            return;
+        }
+    }
+
+    payhsm_shutdown();
+    static const char *const WIPE[] = {
+        "mk.bin", "lmk.bin", "keys.vault", "ext_keys.vault", "cards.pvv",
+        "lmk_share_1.sss", "lmk_share_2.sss", "lmk_share_3.sss",
+        NULL
+    };
+    for (int i = 0; WIPE[i]; i++)
+        provision_unlink(dir, WIPE[i]);
+    payhsm_admin_reset_on_new_provision(dir);
+
+    audit_log("Provision HSM — reset complet (nouvelle LMK requise via panneau LMK)");
+    char esc_dir[256];
+    json_escape(dir, esc_dir, sizeof(esc_dir));
+    snprintf(out, n,
+        "{\"rc\":0,\"message\":\"Nouveau cycle HSM : ancienne LMK et coffre effacés. "
+        "Étapes : (1) LMK T0 mk-generate + parts SSS, (2) reconstruction SSS ou init TRNG, "
+        "(3) Démarrer HSM, (4) SWITCH INIT puis SWITCH PROVISION, "
+        "(5) simulation : POST /api/switch/init puis provision-keys.\","
+        "\"dataDir\":\"%s\",\"reset\":1}",
+        esc_dir);
+}
+
+static void dispatch_api(const char *path, const char *method, const char *body, char *out, size_t n) {
     if (strcmp(path, "/api/health") == 0) api_health(out, n);
     else if (strcmp(path, "/api/status") == 0) api_status(out, n);
     else if (strcmp(path, "/api/provision") == 0) api_provision(body, out, n);
@@ -2118,6 +2155,7 @@ static void dispatch_api(const char *path, const char *body, char *out, size_t n
     else if (strcmp(path, "/api/translate-zpk") == 0) api_translate_zpk(body, out, n);
     else if (strcmp(path, "/api/verify-zpk") == 0) api_verify_zpk(body, out, n);
     else if (strcmp(path, "/api/vault") == 0) api_vault_list(out, n);
+    else if (strcmp(path, "/api/vault/clear") == 0) api_vault_clear(out, n);
     else if (strcmp(path, "/api/kcv") == 0) api_kcv(body, out, n);
     else if (strcmp(path, "/api/mac/calc") == 0) api_mac_calc(body, out, n);
     else if (strcmp(path, "/api/mac/verify") == 0) api_mac_verify(body, out, n);
@@ -2141,15 +2179,44 @@ static void dispatch_api(const char *path, const char *body, char *out, size_t n
     else if (strcmp(path, "/api/lmk/init-trng") == 0) api_lmk_init_trng(body, out, n);
     else if (strcmp(path, "/api/security/logs") == 0) api_security_logs(out, n);
     else if (strcmp(path, "/api/vault/export") == 0) api_vault_export(out, n);
+    else if (strncmp(path, "/api/hsm/transport-gcm", 22) == 0) {
+        const char *q = strchr(path, '?');
+        api_transport_gcm(q ? q + 1 : NULL, out, n);
+    }
+    else if (strcmp(path, "/api/ext/vault") == 0) handle_EKM_LIST(out, n);
     else if (strcmp(path, "/api/switch/derive-terminal") == 0) api_keys_derive_terminal(body, out, n);
     else if (strcmp(path, "/api/switch/wrap-key") == 0) api_wrap_key(body, out, n);
     else if (strcmp(path, "/api/switch/wrap-zpk") == 0) api_wrap_zpk(body, out, n);
+    /* ── Admin Switch ── */
+    else if (strcmp(path, "/api/admin/switch/init") == 0) api_admin_switch_init(out, n);
+    else if (strcmp(path, "/api/admin/switch/status") == 0) api_admin_switch_status(out, n);
+    else if (strcmp(path, "/api/admin/switch/provision") == 0) api_admin_switch_provision(out, n);
+    else if (strcmp(path, "/api/admin/switch/logs") == 0) api_admin_switch_logs(out, n);
+    /* ── Admin ATM ── */
+    else if (strcmp(path, "/api/admin/atm/add") == 0) api_admin_atm_add(body, out, n);
+    else if (strcmp(path, "/api/admin/atm/list") == 0) api_admin_atm_list(out, n);
+    else if (strcmp(path, "/api/admin/atm/status") == 0) api_admin_atm_status(body, out, n);
+    else if (strcmp(path, "/api/admin/atm/provision") == 0) api_admin_atm_provision(body, out, n);
+    else if (strcmp(path, "/api/admin/atm/enable") == 0) api_admin_atm_set_status(body, out, n, ATM_ACTIVE);
+    else if (strcmp(path, "/api/admin/atm/disable") == 0) api_admin_atm_set_status(body, out, n, ATM_INACTIVE);
+    else if (strcmp(path, "/api/admin/atm/block") == 0) api_admin_atm_set_status(body, out, n, ATM_BLOCKED);
+    else if (strcmp(path, "/api/admin/atm/remove") == 0) api_admin_atm_remove(body, out, n);
+    else if (strcmp(path, "/api/admin/atm/kcv") == 0) api_admin_atm_kcv(body, out, n);
+    else if (strcmp(path, "/api/admin/atm/connect") == 0) api_admin_atm_connect(body, out, n);
+    else if (strcmp(path, "/api/admin/atm/disconnect") == 0) api_admin_atm_disconnect(body, out, n);
+    else if (strcmp(path, "/api/admin/atm/rotate-keys") == 0) api_admin_atm_rotate(body, out, n);
     else if (strcmp(path, "/api/lmk/encrypt") == 0) api_lmk_encrypt(body, out, n);
     else if (strcmp(path, "/api/lmk/decrypt") == 0) api_lmk_decrypt(body, out, n);
     else if (strcmp(path, "/api/hsm/a0") == 0) api_hsm_a0(body, out, n);
     else if (strcmp(path, "/api/hsm/a6") == 0) api_hsm_a6(body, out, n);
     else if (strcmp(path, "/api/hsm/a8") == 0) api_hsm_a8(body, out, n);
+    else if (strcmp(path, "/api/key-exchange/export-under-zmk") == 0)
+        api_key_exchange_export_under_zmk(body, out, n);
+    else if (strcmp(path, "/api/key-exchange/import") == 0)
+        api_key_exchange_import(body, out, n);
     else if (strcmp(path, "/api/hsm/cmd") == 0) api_hsm_cmd_raw(body, out, n);
+    else if (strcmp(path, "/api/hsm/mode") == 0 && strcmp(method, "GET")  == 0) api_hsm_mode_get(out, n);
+    else if (strcmp(path, "/api/hsm/mode") == 0 && strcmp(method, "POST") == 0) api_hsm_mode_set(body, out, n);
     else if (strcmp(path, "/api/shutdown") == 0) {
         audit_log("shutdown HSM");
         payhsm_emv_clear_session();
@@ -2213,7 +2280,7 @@ static int serve_static(int fd, const char *path) {
 
 static void handle_client(int fd) {
     char *req = (char *)malloc(HTTP_BUF);
-    char *resp = (char *)malloc(HTTP_BUF);
+    char *resp = (char *)calloc(1, HTTP_BUF);  /* calloc garantit resp[0]=' ' */
     if (!req || !resp) { free(req); free(resp); close(fd); return; }
 
     int n = read_request(fd, req, HTTP_BUF);
@@ -2229,12 +2296,11 @@ static void handle_client(int fd) {
     sscanf(req, "%15s %255s", method, path);
 
     if (strncmp(path, "/api/", 5) == 0) {
+        /* read_request() a déjà lu le corps complet (Content-Length octets). */
         const char *body = request_body(req);
-        int blen = body_length(req);
-        if (blen > 0 && (int)strlen(body) < blen) {
-            /* corps incomplet — accepter ce qu'on a */
-        }
-        dispatch_api(path, body, resp, HTTP_BUF);
+        pthread_mutex_lock(&g_dispatch_lock);
+        dispatch_api(path, method, body, resp, HTTP_BUF);
+        pthread_mutex_unlock(&g_dispatch_lock);
         send_json(fd, 200, resp);
     } else if (strcmp(method, "GET") == 0) {
         serve_static(fd, path);
@@ -2247,10 +2313,205 @@ static void handle_client(int fd) {
     close(fd);
 }
 
+/* ════════════════════════════════════════════════════════════════════════
+   SERVEUR TCP BRUT HSM (mode "wire" sans framing ISO 8583)
+   ────────────────────────────────────────────────────────────────────────
+   Le client envoie une trame HSM brute, ex :   0001B2HELLO
+   Le serveur répond la trame brute, ex     :   0001B300HELLO
+
+   - Réutilise le dispatcher existant hsm_dispatch_wire() (aucune logique dupliquée).
+   - Indépendant du serveur ISO 8583 (net/tcp_server.c) qui lui garde son
+     framing longueur 2 octets — on ne casse pas l'existant.
+   - Port configurable via env PAYHSM_TCP_PORT (défaut 1500 ; 0 = désactivé).
+   - TLS optionnel : PAYHSM_TCP_TLS=1 + PAYHSM_TCP_CERT + PAYHSM_TCP_KEY.
+     TLS mal configuré → message clair + repli TCP simple.
+     TLS désactivé    → warning "TLS disabled: development mode only".
+   - Sécurité : log = code commande (2 lettres) + longueur ; jamais de clé/PIN.
+   - Concurrence : g_dispatch_lock sérialise l'accès au HSM (partagé avec HTTP).
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* Extrait la valeur de "rawResponse":"..." du JSON renvoyé par le dispatcher. */
+static void extract_raw_response(const char *json, char *out, size_t cap) {
+    out[0] = '\0';
+    const char *key = "\"rawResponse\":\"";
+    const char *p = strstr(json, key);
+    if (!p) return;
+    p += strlen(key);
+    size_t i = 0;
+    while (*p && *p != '"' && i + 1 < cap) out[i++] = *p++;
+    out[i] = '\0';
+}
+
+/* Trame brute → réponse brute. Sérialisé via g_dispatch_lock. */
+static void raw_dispatch_locked(const char *frame, size_t flen,
+                                char *raw_out, size_t cap) {
+    raw_out[0] = '\0';
+    if (flen < 6) {
+        snprintf(raw_out, cap, "%.4sFE02", flen >= 4 ? frame : "0000");
+        return;
+    }
+    char hdr[5];
+    strncpy(hdr, frame, 4); hdr[4] = '\0';
+
+    char json[HTTP_BUF];
+    pthread_mutex_lock(&g_dispatch_lock);
+    hsm_dispatch_wire(hdr, frame, flen, json, sizeof(json));
+    pthread_mutex_unlock(&g_dispatch_lock);
+
+    extract_raw_response(json, raw_out, cap);
+}
+
+typedef struct { int fd; SSL *ssl; } raw_conn_t;
+typedef struct { int port; SSL_CTX *ctx; } raw_srv_t;
+
+/* Lit une trame : jusqu'à fin de ligne (\r ou \n), EOF (half-close type nc),
+   buffer plein, ou timeout SO_RCVTIMEO. */
+static int raw_read(raw_conn_t *c, char *buf, size_t cap) {
+    size_t n = 0;
+    while (n + 1 < cap) {
+        int r = c->ssl ? SSL_read(c->ssl, buf + n, (int)(cap - n - 1))
+                       : (int)recv(c->fd, buf + n, cap - n - 1, 0);
+        if (r <= 0) break;
+        n += (size_t)r;
+        buf[n] = '\0';
+        char *nl = strpbrk(buf, "\r\n");
+        if (nl) { *nl = '\0'; n = (size_t)(nl - buf); break; }
+    }
+    return (int)n;
+}
+
+static void *raw_conn_thread(void *arg) {
+    raw_conn_t *c = (raw_conn_t *)arg;
+    if (c->ssl && SSL_accept(c->ssl) <= 0) goto done;
+
+    char frame[1024], raw[2048];
+    int n = raw_read(c, frame, sizeof(frame));
+    if (n >= 1) {
+        raw_dispatch_locked(frame, (size_t)n, raw, sizeof(raw));
+        /* Log non sensible : seules les 2 lettres de commande + longueurs. */
+        fprintf(stderr, "[tcp] cmd=%c%c len=%d -> %zu octets\n",
+                n >= 6 ? frame[4] : '?', n >= 6 ? frame[5] : '?',
+                n, strlen(raw));
+        if (raw[0]) {
+            if (c->ssl) SSL_write(c->ssl, raw, (int)strlen(raw));
+            else        send(c->fd, raw, strlen(raw), 0);
+        }
+    }
+done:
+    if (c->ssl) { SSL_shutdown(c->ssl); SSL_free(c->ssl); }
+    close(c->fd);
+    free(c);
+    return NULL;
+}
+
+static void *raw_tcp_server_thread(void *arg) {
+    raw_srv_t *s = (raw_srv_t *)arg;
+
+    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) { perror("[tcp] socket"); free(s); return NULL; }
+    int opt = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons((uint16_t)s->port);
+
+    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "[tcp] bind port %d échec (%s) — mode TCP brut désactivé\n",
+                s->port, strerror(errno));
+        close(srv); if (s->ctx) SSL_CTX_free(s->ctx); free(s);
+        return NULL;
+    }
+    if (listen(srv, 16) < 0) {
+        perror("[tcp] listen");
+        close(srv); if (s->ctx) SSL_CTX_free(s->ctx); free(s);
+        return NULL;
+    }
+    fprintf(stderr, "[tcp] HSM brut sur 0.0.0.0:%d (TLS=%s)\n",
+            s->port, s->ctx ? "oui" : "non");
+
+    for (;;) {
+        int cfd = accept(srv, NULL, NULL);
+        if (cfd < 0) { if (errno == EINTR) continue; perror("[tcp] accept"); break; }
+
+        /* Sans framing de longueur, on détecte la fin de trame par inactivité.
+           1s : assez court pour que `nc` (sans half-close) reçoive vite la
+           réponse, assez long pour un client piped. Pour une réponse instantanée,
+           terminer la trame par '\n' (géré dans raw_read). */
+        struct timeval tv = { 1, 0 };
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        raw_conn_t *c = (raw_conn_t *)calloc(1, sizeof(*c));
+        if (!c) { close(cfd); continue; }
+        c->fd = cfd;
+        if (s->ctx) { c->ssl = SSL_new(s->ctx); SSL_set_fd(c->ssl, cfd); }
+
+        pthread_t tid; pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&tid, &at, raw_conn_thread, c) != 0) { free(c); close(cfd); }
+        pthread_attr_destroy(&at);
+    }
+    close(srv); if (s->ctx) SSL_CTX_free(s->ctx); free(s);
+    return NULL;
+}
+
+/* Lance le serveur TCP brut dans un thread si PAYHSM_TCP_PORT != 0. */
+static void raw_tcp_start_if_configured(void) {
+    int port = 1500;
+    const char *ps = getenv("PAYHSM_TCP_PORT");
+    if (ps && ps[0]) port = atoi(ps);
+    if (port <= 0) { fprintf(stderr, "[tcp] désactivé (PAYHSM_TCP_PORT=%d)\n", port); return; }
+
+    SSL_CTX *ctx = NULL;
+    const char *tls = getenv("PAYHSM_TCP_TLS");
+    if (tls && (tls[0] == '1' || tls[0] == 'y' || tls[0] == 'Y')) {
+        const char *cert = getenv("PAYHSM_TCP_CERT");
+        const char *key  = getenv("PAYHSM_TCP_KEY");
+        if (!cert || !cert[0] || !key || !key[0]) {
+            fprintf(stderr, "[tcp] TLS demandé mais PAYHSM_TCP_CERT/PAYHSM_TCP_KEY "
+                            "manquants — repli TCP simple\n");
+        } else {
+            SSL_load_error_strings();
+            OpenSSL_add_ssl_algorithms();
+            ctx = SSL_CTX_new(TLS_server_method());
+            if (!ctx ||
+                SSL_CTX_use_certificate_file(ctx, cert, SSL_FILETYPE_PEM) <= 0 ||
+                SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM) <= 0) {
+                fprintf(stderr, "[tcp] TLS: chargement cert/clé échec — repli TCP simple\n");
+                if (ctx) { SSL_CTX_free(ctx); ctx = NULL; }
+            } else {
+                SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+                fprintf(stderr, "[tcp] TLS activé (cert=%s)\n", cert);
+            }
+        }
+    }
+    if (!ctx)
+        fprintf(stderr, "[tcp] TLS disabled: development mode only\n");
+
+    raw_srv_t *s = (raw_srv_t *)calloc(1, sizeof(*s));
+    if (!s) { if (ctx) SSL_CTX_free(ctx); return; }
+    s->port = port; s->ctx = ctx;
+
+    pthread_t tid; pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&tid, &at, raw_tcp_server_thread, s) != 0) {
+        if (ctx) SSL_CTX_free(ctx);
+        free(s);
+    }
+    pthread_attr_destroy(&at);
+}
+
 /* Exported: run the HTTP admin server (blocks until socket error). */
 void payhsm_httpd_serve(int port, const char *static_root)
 {
     signal(SIGPIPE, SIG_IGN);
+    g_start_time  = time(NULL);
+    g_server_port = port;
+    raw_tcp_start_if_configured();   /* démarre le mode TCP brut HSM (port séparé) */
     if (static_root && static_root[0])
         strncpy(g_static_root, static_root, sizeof(g_static_root) - 1);
 

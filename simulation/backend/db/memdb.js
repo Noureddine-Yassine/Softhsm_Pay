@@ -38,6 +38,10 @@ export const db = {
   lastHsmBootId: null,
   /** Répertoire données PayHSM (api/lmk/status) */
   lastHsmDataDir: null,
+  /** true après POST /api/switch/init ou restauration coffre (même LMK) */
+  switchInitialized: false,
+  /** Journal imports A6 automatiques */
+  switchExchangeLogs: [],
 };
 
 export function resetDemoCards() {

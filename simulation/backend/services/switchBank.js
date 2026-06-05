@@ -61,7 +61,7 @@ export async function switchA_intra({ txId, pan, pinBlock, terminal, amount }) {
 export async function switchA_translate({ txId, pinBlock_tpkA, terminal }) {
   await requireHsmReady();
   const term = terminal || CONFIG.GAB_TERMINAL;
-  const tpk = `TPK-${term}`;
+  const tpk = CONFIG.KEYS.TPK;
 
   const r = await payhsmCall({
     txId,
@@ -74,7 +74,7 @@ export async function switchA_translate({ txId, pinBlock_tpkA, terminal }) {
     callFn: () => HsmA.translate(term, pinBlock_tpkA, CONFIG.KEYS.ZPK),
   });
 
-  if (r.rc !== 0 && !r.pinBlockZpk) {
+  if (r.rc !== 0 || !r.pinBlockZpk) {
     throw new Error(r.message || 'Translation TPK→ZPK PayHSM échouée');
   }
 

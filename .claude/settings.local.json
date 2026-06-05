@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make clean *)",
+      "Bash(make)",
+      "Bash(make bin/payhsm-httpd.o)",
+      "Bash(gcc -Wall -Wextra -I. -c bin/payhsm-httpd.c -o bin/payhsm-httpd.o)",
+      "Bash(curl -s http://127.0.0.1:8765/)",
+      "Bash(make -C src/lib/payhsm)",
+      "Bash(pkill -f payhsm-httpd)",
+      "Bash(./src/lib/payhsm/bin/payhsm-httpd 8765 ./frontend)",
+      "Bash(curl -s http://127.0.0.1:8765/api/health)",
+      "Bash(/home/oussama/Desktop/softHSM_main/src/lib/payhsm/bin/payhsm-httpd 8765 /home/oussama/Desktop/softHSM_main/frontend)",
+      "Read(//tmp/**)",
+      "Bash(curl -s -X POST http://127.0.0.1:8765/api/provision -H 'Content-Type: application/json' -d '{\"dataDir\":\"/tmp/phsm-v2\"}')",
+      "Bash(curl -s -X POST http://127.0.0.1:8765/api/startup -H 'Content-Type: application/json' -d '{}')",
+      "Bash(curl -s -X POST http://127.0.0.1:8765/api/lmk/mk-generate -H 'Content-Type: application/json' -d '{\"passphrase\":\"Admin@Secure2025!\",\"dataDir\":\"/tmp/phsm-v2\"}')",
+      "Bash(curl -s -X POST http://127.0.0.1:8765/api/lmk/init-trng -H 'Content-Type: application/json' -d '{\"passphrase\":\"Admin@Secure2025!\",\"dataDir\":\"/tmp/phsm-v2\"}')",
+      "Bash(curl -s -X POST http://127.0.0.1:8765/api/lmk/shamir-generate -H 'Content-Type: application/json' -d '{\"passphrase\":\"Admin@Secure2025!\",\"dataDir\":\"/tmp/phsm-v2\"}')",
+      "Bash(grep -E \"\\\\.c$|\\\\.h$\")",
+      "Bash(cp /tmp/paylogic-logo-test2.png /home/oussama/Desktop/softHSM_main/frontend/paylogic-logo.png && echo \"copied\" && file /home/oussama/Desktop/softHSM_main/frontend/paylogic-logo.png)",
+      "Bash(make all *)",
+      "Bash(grep -E \"error:|^gcc.*payhsm-httpd$|^gcc.*payhsm-isod$\")",
+      "Bash(curl -s http://127.0.0.1:4000/api/health)",
+      "Bash(curl -s http://127.0.0.1:8765/api/lmk/status)",
+      "Bash(python3 -m json.tool)",
+      "Bash(xargs grep -l \"objectdir\\\\|tokendir\")",
+      "Bash(gcc --version)",
+      "Bash(gcc -fsyntax-only -Wall -Wextra -I src/lib/payhsm src/lib/payhsm/bin/payhsm-httpd.c)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
+    ]
+  }
+}

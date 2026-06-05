@@ -52,9 +52,28 @@
   --blue-border:  #bfdbfe;
 
   /* Terminal / LCD — kept dark (hardware simulation) */
-  --term-bg:     #0d1117;
-  --term-border: #2d333b;
-  --term-text:   #e2e8f0;
+  /* ── Terminal — Thème Adventure ── */
+  --term-bg:         #040404;   /* background */
+  --term-border:     #685656;   /* brightBlack */
+  --term-text:       #feffff;   /* foreground */
+  --term-black:      #040404;
+  --term-red:        #d84a33;
+  --term-green:      #5da602;
+  --term-yellow:     #eebb6e;
+  --term-blue:       #417ab3;
+  --term-purple:     #e5c499;
+  --term-cyan:       #bdcfe5;
+  --term-white:      #dbded8;
+  --term-br-black:   #685656;
+  --term-br-red:     #d76b42;
+  --term-br-green:   #99b52c;
+  --term-br-yellow:  #ffb670;
+  --term-br-blue:    #97d7ef;
+  --term-br-purple:  #aa7900;
+  --term-br-cyan:    #bdcfe5;
+  --term-br-white:   #e4d5c7;
+  --term-selection:  #606060;
+  --term-cursor:     #feffff;
   --hex:         #f5870a;
 
   /* Shadows */
@@ -1040,9 +1059,9 @@ button.btn-ghost:hover {
   justify-content: space-between;
   align-items: center;
   padding: .45rem .85rem;
-  background: #161b22;
+  background: #0c0c0c;
   border-bottom: 1px solid var(--term-border);
-  color: #8b949e;
+  color: var(--term-green);
   font-size: .72rem;
   letter-spacing: .06em;
   border-radius: 8px 8px 0 0;
@@ -1055,37 +1074,38 @@ button.btn-ghost:hover {
   color: var(--term-text);
   line-height: 1.6;
 }
-.terminal-output .t-cmd   { color: var(--co-400); }
-.terminal-output .t-ok    { color: #4ade80; }
-.terminal-output .t-err   { color: #f87171; }
-.terminal-output .t-warn  { color: #f5870a; }
-.terminal-output .t-info  { color: #fdba74; }
-.terminal-output .t-muted { color: #6b7280; }
+.terminal-output .t-cmd   { color: var(--term-br-blue); }
+.terminal-output .t-ok    { color: var(--term-br-green); }
+.terminal-output .t-err   { color: var(--term-red); }
+.terminal-output .t-warn  { color: var(--term-br-yellow); }
+.terminal-output .t-info  { color: var(--term-br-cyan); }
+.terminal-output .t-muted { color: var(--term-br-black); }
+.terminal-output .t-bold  { color: var(--term-br-white); font-weight: 600; }
 
 .terminal-input-row {
   display: flex;
   align-items: center;
   padding: .5rem .85rem;
   border-top: 1px solid var(--term-border);
-  background: #0d1117;
+  background: var(--term-bg);
   gap: .5rem;
   flex-shrink: 0;
   border-radius: 0 0 8px 8px;
 }
-.term-prompt { color: var(--co-400); font-weight: 700; white-space: nowrap; user-select: none; }
+.term-prompt { color: var(--term-green); font-weight: 700; white-space: nowrap; user-select: none; }
 .terminal-input {
   flex: 1;
   background: transparent;
   border: none;
-  color: var(--hex);
+  color: var(--term-text);
   font-family: inherit;
   font-size: .78rem;
   outline: none;
-  caret-color: var(--co-400);
+  caret-color: var(--term-cursor);
 }
-.terminal-input::placeholder { color: #4b5563; }
+.terminal-input::placeholder { color: var(--term-br-black); }
 
-/* Floating terminal */
+/* Floating terminal — Thème Adventure */
 .float-term {
   position: fixed;
   bottom: 24px;
@@ -1095,10 +1115,10 @@ button.btn-ghost:hover {
   z-index: 900;
   display: flex;
   flex-direction: column;
-  background: #0d1117;
-  border: 1.5px solid var(--co-500);
+  background: var(--term-bg);
+  border: 1.5px solid var(--term-br-black);
   border-radius: 10px;
-  box-shadow: 0 20px 60px rgba(0,0,0,.35), 0 0 0 1px rgba(245,135,10,.12);
+  box-shadow: 0 20px 60px rgba(0,0,0,.7), 0 0 0 1px rgba(104,86,86,.3);
   font-family: 'Fira Code', 'JetBrains Mono', Consolas, monospace;
   font-size: .78rem;
   resize: both;
@@ -1111,19 +1131,25 @@ button.btn-ghost:hover {
   justify-content: space-between;
   align-items: center;
   padding: .5rem .9rem;
-  background: #161b22;
-  border-bottom: 1px solid rgba(245,135,10,.18);
+  background: #0c0c0c;
+  border-bottom: 1px solid var(--term-br-black);
   cursor: move;
   user-select: none;
   border-radius: 10px 10px 0 0;
   flex-shrink: 0;
 }
-.float-term-title { color: var(--co-400); font-size: .73rem; letter-spacing: .07em; font-weight: 600; }
+.float-term-title {
+  color: var(--term-green);
+  font-size: .73rem;
+  letter-spacing: .07em;
+  font-weight: 600;
+}
+.float-term-title::before { content: '● '; color: var(--term-red); }
 .float-term-controls { display: flex; gap: .35rem; }
 .float-term-btn {
   background: transparent;
-  border: 1px solid #30363d;
-  color: #8b949e;
+  border: 1px solid var(--term-br-black);
+  color: var(--term-br-black);
   min-width: 24px;
   height: 24px;
   cursor: pointer;
@@ -1134,8 +1160,8 @@ button.btn-ghost:hover {
   line-height: 1;
   transition: all .15s;
 }
-.float-term-btn:hover          { color: var(--term-text); border-color: #6e7681; }
-#btn-float-close:hover         { color: #f87171; border-color: #f87171; }
+.float-term-btn:hover          { color: var(--term-white); border-color: var(--term-white); }
+#btn-float-close:hover         { color: var(--term-red); border-color: var(--term-red); }
 .float-term .terminal-output   { flex: 1; overflow-y: auto; padding: .65rem .9rem; line-height: 1.55; }
 .float-term .terminal-input-row { flex-shrink: 0; border-radius: 0 0 10px 10px; }
 
@@ -1143,6 +1169,18 @@ button.btn-ghost:hover {
 .thin-scroll::-webkit-scrollbar        { width: 5px; }
 .thin-scroll::-webkit-scrollbar-track  { background: transparent; }
 .thin-scroll::-webkit-scrollbar-thumb  { background: var(--co-200); border-radius: 99px; }
+
+/* ── Sélection de texte dans le terminal — Adventure ── */
+.terminal-output::selection,
+.terminal-output *::selection {
+  background: var(--term-selection);
+  color: var(--term-br-white);
+}
+.float-term .terminal-output::selection,
+.float-term .terminal-output *::selection {
+  background: var(--term-selection);
+  color: var(--term-br-white);
+}
 
 /* ── Responsive ────────────────────────────────────────────────── */
 @media (max-width: 1280px) { .grid:not(.grid-2col) { grid-template-columns: 1fr; } }
@@ -1279,3 +1317,4 @@ body {
 .log .ok   { font-weight: 500; }
 .log .err  { font-weight: 500; }
 .log .warn { font-weight: 500; }
+
